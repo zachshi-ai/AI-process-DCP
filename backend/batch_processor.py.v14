@@ -1,0 +1,351 @@
+import os
+import time
+import json
+import re
+import openpyxl
+import logging
+import hashlib
+from typing import List, Optional
+from logger_setup import global_logger as logger
+from config_manager import ConfigManager
+from crawler import WebCrawler
+from llm_processor import LLMProcessor
+from history_store import HistoryStore
+
+
+def _parse_json_from_text(text: str):
+    """
+    从任意 LLM 文本中尽力解析出 JSON。
+    适配常见情况：
+    1) 直接返回 JSON；
+    2) Markdown 代码块 ``` ... ```（或 ```json ... ```）内包含 JSON；
+    3) 文本前后有解释，但中间夹着一段 JSON。
+    返回 (parsed_obj, extracted_json_text)；若无法解析则返回 (None, "")。
+    """
+    s = str(text or "").strip()
+    if not s:
+        return None, ""
+
+    def _try_load(candidate: str):
+        c = str(candidate or "").strip()
+        if not c:
+            return None, ""
+        try:
+            return json.loads(c), c
+        except Exception:
+            return None, ""
+
+    obj, used = _try_load(s)
+    if obj is not None:
+        return obj, used
+
+    for m in re.finditer(r"```(?:json|JSON)?\s*([\s\S]*?)```", s, flags=re.MULTILINE):
+        obj, used = _try_load(m.group(1))
+        if obj is not None:
+            return obj, used
+
+    first = s.find("{")
+    last = s.rfind("}")
+    if first != -1 and last != -1 and last > first:
+        obj, used = _try_load(s[first:last + 1])
+        if obj is not None:
+            return obj, used
+
+    first = s.find("[")
+    last = s.rfind("]")
+    if first != -1 and last != -1 and last > first:
+        obj, used = _try_load(s[first:last + 1])
+        if obj is not None:
+            return obj, used
+
+    return None, ""
+
+
+class BatchProcessor:
+    """
+    批量处理引擎：支持读取任务列表，动态匹配 Skill，实时写入 Excel，并支持断点续跑。
+    """
+
+    def __init__(
+        self,
+        config_manager: ConfigManager,
+        llm_processor: LLMProcessor,
+        output_dir: str = "output",
+        history_store: Optional[HistoryStore] = None,
+        event_id: Optional[int] = None,
+        drill_config: Optional[dict] = None,
+        skill_name: Optional[str] = None,
+    ):
+        self.config_manager = config_manager
+        self.llm_processor = llm_processor
+        self.output_dir = os.path.abspath(output_dir)
+        os.makedirs(self.output_dir, exist_ok=True)
+        self.history_store = history_store
+        self.event_id = event_id
+        self.drill_config = drill_config or {}
+        self.skill_name = skill_name
+
+        # Excel 报告和断点续跑文件路径
+        self.run_id = int(time.time())
+        self.run_dir = os.path.join(self.output_dir, f"run_{self.run_id}")
+        os.makedirs(self.run_dir, exist_ok=True)
+        self.excel_path = os.path.join(self.run_dir, f"report_{self.run_id}.xlsx")
+        self.log_path = os.path.join(self.run_dir, f"run_{self.run_id}.log")
+        self.breakpoint_file = os.path.join(self.run_dir, "breakpoint.json")
+
+        self._init_excel()
+        if self.history_store and self.event_id:
+            self.history_store.update_event(
+                self.event_id,
+                path=self.run_dir,
+                meta={"report_path": self.excel_path, "log_path": self.log_path},
+            )
+
+    def _init_excel(self):
+        """初始化 Excel 文件表头"""
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["URL", "匹配技能", "分析证据", "处理结果"])
+        wb.save(self.excel_path)
+        logger.info(f"已创建 Excel 报告: {self.excel_path}")
+
+    def _load_processed_urls(self) -> set:
+        """加载已成功处理的 URL（断点续跑）"""
+        if os.path.exists(self.breakpoint_file):
+            try:
+                with open(self.breakpoint_file, "r", encoding="utf-8") as f:
+                    return set(json.load(f))
+            except Exception as e:
+                logger.warning(f"读取断点文件失败: {e}")
+        return set()
+
+    def _save_processed_url(self, url: str):
+        """记录已成功处理的 URL"""
+        urls = self._load_processed_urls()
+        urls.add(url)
+        with open(self.breakpoint_file, "w", encoding="utf-8") as f:
+            json.dump(list(urls), f)
+
+    def append_to_excel(self, url: str, skill: str, evidence: str, result: str):
+        """将单条记录实时追加到 Excel 中"""
+        try:
+            wb = openpyxl.load_workbook(self.excel_path)
+            ws = wb.active
+            ws.append([url, skill, evidence, result])
+            wb.save(self.excel_path)
+        except Exception as e:
+            logger.error(f"写入 Excel 失败 (URL: {url}): {e}")
+
+    def _extract_fields_and_targets(self, page_data: dict, *, max_targets: int = 200) -> tuple:
+        fields = {}
+        targets = []
+        target_seen = set()
+        target_total = 0
+
+        def _is_javascript_value(v: str) -> bool:
+            s = (v or "").strip().lower()
+            if not s:
+                return False
+            if s == "javascript:void(0)" or s == "void(0)" or s.startswith("javascript:"):
+                return True
+            return False
+
+        try:
+            for ff in (page_data or {}).get("form_fields") or []:
+                if not isinstance(ff, dict):
+                    continue
+                k = str(ff.get("id") or ff.get("name") or "").strip()
+                if not k:
+                    continue
+                display = str(ff.get("display") or "").strip()
+                val = str(ff.get("value") or "").strip()
+                v = display.splitlines()[0].strip() if display else val
+                if not v:
+                    continue
+                if _is_javascript_value(v):
+                    continue
+                if k not in fields:
+                    fields[k] = v[:200]
+                if len(fields) >= 50:
+                    break
+        except Exception:
+            pass
+
+        try:
+            content = str((page_data or {}).get("content") or "")
+            for line in content.splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                m = re.match(r"^(.{1,30})[：:]\s*(.{1,200})$", s)
+                if not m:
+                    continue
+                k = m.group(1).strip()
+                v = m.group(2).strip()
+                if not k or not v:
+                    continue
+                kl = k.lower()
+                if any(x in kl for x in ["href", "onclick", "javascript"]):
+                    continue
+                if _is_javascript_value(v):
+                    continue
+                if any(x in k.lower() for x in ["http", "https"]):
+                    continue
+                if k not in fields:
+                    fields[k] = v[:200]
+                if len(fields) >= 80:
+                    break
+        except Exception:
+            pass
+
+        try:
+            for l in (page_data or {}).get("links") or []:
+                if not isinstance(l, dict):
+                    continue
+                u = str(l.get("url") or "").strip()
+                raw_u = str(l.get("raw_url") or "").strip()
+                onclick = str(l.get("onclick") or "").strip()
+                resolved = bool(l.get("resolved"))
+                if not u and not raw_u:
+                    continue
+                target_total += 1
+                u_lower = (u or raw_u).lower()
+                if u_lower.startswith("javascript:") or u_lower in ["javascript:void(0)", "void(0)", "javascript:void(0);", "void(0);"]:
+                    key = ("js", raw_u.lower(), onclick[:200].lower())
+                    if key in target_seen:
+                        continue
+                    target_seen.add(key)
+                    targets.append(
+                        {
+                            "text": (str(l.get("text") or "").strip())[:80],
+                            "url": "",
+                            "raw_url": raw_u,
+                            "onclick": onclick[:200],
+                            "resolved": resolved,
+                        }
+                    )
+                    if len(targets) >= max_targets:
+                        break
+                    continue
+                t = str(l.get("text") or "").strip()
+                key = ("url", (u or "").lower())
+                if key in target_seen:
+                    continue
+                target_seen.add(key)
+                targets.append({"text": t[:80], "url": u or "", "raw_url": raw_u, "onclick": onclick[:200], "resolved": resolved})
+                if len(targets) >= max_targets:
+                    break
+        except Exception:
+            pass
+
+        truncated = bool(target_total > len(targets))
+        return fields, targets, target_total, truncated
+
+    async def process_batch(self, urls: List[str], custom_skills_dict: dict = None, inline_payloads: dict = None):
+        file_handler = logging.FileHandler(self.log_path, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+        logger.addHandler(file_handler)
+        logger.setLevel(logging.DEBUG)
+        processed_urls = self._load_processed_urls()
+        logger.info(f"开始批量处理，共 {len(urls)} 条任务。已发现 {len(processed_urls)} 条断点记录。")
+        pending_urls = [u for u in urls if u not in processed_urls]
+
+        try:
+            inline_payloads = inline_payloads or {}
+            for url in pending_urls:
+                try:
+                    matched_skill = None
+                    candidates = []
+                    if self.skill_name:
+                        matched_skill = self.skill_name
+                    elif not custom_skills_dict:
+                        matched_skill, candidates = self.config_manager.match_skill(url, custom_skills=None)
+                        if not matched_skill:
+                            matched_skill = "summary"
+                    elif custom_skills_dict and len(custom_skills_dict.keys()) == 1:
+                        matched_skill = list(custom_skills_dict.keys())[0]
+                    else:
+                        matched_skill, candidates = self.config_manager.match_skill(url, custom_skills=custom_skills_dict)
+
+                    if not matched_skill:
+                        cand_str = ", ".join(candidates) if candidates else "无"
+                        evidence = "技能匹配失败"
+                        result = f"未匹配到唯一技能 (候选项: {cand_str})"
+                        self.append_to_excel(url, "无", evidence, result)
+                        logger.warning(f"URL: {url} 未匹配到唯一技能")
+                        continue
+
+                    is_inline_payload = url in inline_payloads
+                    drill_enabled = False
+                    root_page = None
+                    inline_payload_text = None
+
+                    if is_inline_payload:
+                        try:
+                            payload = inline_payloads.get(url, {}).get("payload", {})
+                            payload_text = json.dumps(payload, ensure_ascii=False, indent=2)
+                        except Exception:
+                            payload_text = str(inline_payloads.get(url, {}).get("payload", ""))
+                        inline_payload_text = payload_text
+                        root_page = {"url": url, "title": "JSON 输入", "content": payload_text}
+                        crawl_results = [{"url": url, "depth": 1, "content": payload_text}]
+                        drill_meta = {"enabled": False, "source": "json_input"}
+                    else:
+                        crawler = WebCrawler(start_url=url, max_depth=1, headless=True)
+                        snap = await crawler.get_page_snapshot(url)
+                        root_page = snap
+                        crawl_results = [{"url": snap.get("url"), "depth": 1, "content": snap.get("content", "")}]
+                        drill_meta = {"enabled": False}
+
+                    extracted_fields, drill_targets, drill_targets_total, drill_targets_truncated = self._extract_fields_and_targets(
+                        root_page or {}, max_targets=200
+                    )
+
+                    root_texts = []
+                    try:
+                        for it in (crawl_results or [])[:2]:
+                            t = (it.get("content") or "").strip()
+                            if t:
+                                root_texts.append(t)
+                    except Exception:
+                        root_texts = []
+
+                    if is_inline_payload:
+                        combined_content = (inline_payload_text or "\n\n".join(root_texts)).strip()
+                    else:
+                        combined_content = "\n\n".join(root_texts).strip()
+
+                    custom_skill_content = custom_skills_dict.get(matched_skill) if custom_skills_dict else None
+                    final_prompt = self.config_manager.build_final_prompt(matched_skill, combined_content, custom_skill_content)
+
+                    llm_response = self.llm_processor.generate(final_prompt)
+                    evidence = ""
+                    result = str(llm_response or "")
+
+                    self.append_to_excel(url, matched_skill, evidence, result)
+                    if self.history_store and self.event_id:
+                        self.history_store.add_item(
+                            self.event_id,
+                            url,
+                            matched_skill,
+                            evidence,
+                            result,
+                            "success",
+                            meta={"drill": drill_meta},
+                        )
+                        self.history_store.increment_event_progress(
+                            self.event_id,
+                            processed_delta=1,
+                            success_delta=1,
+                        )
+                    self._save_processed_url(url)
+                    logger.info(f"✅ 成功处理: {url}")
+                except Exception as e:
+                    error_msg = f"处理异常: {str(e)}"
+                    logger.error(f"❌ [{url}] {error_msg}")
+                    self.append_to_excel(url, "异常", error_msg[:200], "异常")
+        finally:
+            logger.removeHandler(file_handler)
+            file_handler.close()
+

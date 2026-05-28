@@ -1,0 +1,186 @@
+import { useMemo, useState } from 'react';
+import { Button } from './ui/Button';
+
+type JsonLike = null | boolean | number | string | JsonLike[] | { [k: string]: JsonLike };
+
+function isRecord(v: any): v is Record<string, any> {
+  return !!v && typeof v === 'object' && !Array.isArray(v);
+}
+
+function tryExtractCodeFenceJson(text: string): string | null {
+  const m = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (!m) return null;
+  const inside = (m[1] || '').trim();
+  if (!inside) return null;
+  return inside;
+}
+
+function tryExtractBalancedJson(text: string): string | null {
+  const s = text;
+  const starts: Array<{ ch: '{' | '['; idx: number }> = [];
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '{' || ch === '[') {
+      starts.push({ ch, idx: i });
+      break;
+    }
+  }
+  if (starts.length === 0) return null;
+
+  const start = starts[0];
+  const open = start.ch;
+  const close = open === '{' ? '}' : ']';
+  let depth = 0;
+  let inStr = false;
+  let strQuote: '"' | "'" | null = null;
+  for (let i = start.idx; i < s.length; i++) {
+    const ch = s[i];
+    const prev = i > 0 ? s[i - 1] : '';
+    if (inStr) {
+      if (ch === strQuote && prev !== '\\') {
+        inStr = false;
+        strQuote = null;
+      }
+      continue;
+    }
+    if ((ch === '"' || ch === "'") && prev !== '\\') {
+      inStr = true;
+      strQuote = ch as any;
+      continue;
+    }
+    if (ch === open) depth += 1;
+    if (ch === close) depth -= 1;
+    if (depth === 0) {
+      const candidate = s.slice(start.idx, i + 1).trim();
+      return candidate || null;
+    }
+  }
+  return null;
+}
+
+function normalizeJsonish(text: string): string {
+  let s = text.trim();
+  s = s.replace(/\bNone\b/g, 'null').replace(/\bTrue\b/g, 'true').replace(/\bFalse\b/g, 'false');
+  if (!s.includes('"') && s.includes("'")) {
+    s = s.replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, inner) => {
+      const escaped = String(inner).replace(/"/g, '\\"');
+      return `"${escaped}"`;
+    });
+  }
+  return s;
+}
+
+function safeJsonParse(input: any): { ok: boolean; value: any; normalized?: boolean } {
+  if (typeof input !== 'string') return { ok: true, value: input };
+  const s = input.trim();
+  if (!s) return { ok: true, value: input };
+
+  const codeFence = tryExtractCodeFenceJson(s);
+  const candidate = codeFence || (s.startsWith('{') || s.startsWith('[') ? s : tryExtractBalancedJson(s)) || s;
+
+  try {
+    return { ok: true, value: JSON.parse(candidate) };
+  } catch (_) {
+    try {
+      const normalized = normalizeJsonish(candidate);
+      return { ok: true, value: JSON.parse(normalized), normalized: true };
+    } catch (_) {
+      return { ok: false, value: input };
+    }
+  }
+}
+
+function toPreview(v: any): string {
+  if (v == null) return String(v);
+  if (typeof v === 'string') return v.length > 120 ? `${v.slice(0, 120)}…` : v;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  if (Array.isArray(v)) return `Array(${v.length})`;
+  if (isRecord(v)) return `Object(${Object.keys(v).length})`;
+  return String(v);
+}
+
+function JsonNode({ name, value, depth }: { name?: string; value: any; depth: number }) {
+  const isLeaf = value == null || typeof value !== 'object';
+  const label = name ? `${name}: ` : '';
+  if (isLeaf) {
+    return (
+      <div className="flex gap-2 items-start">
+        <div className="text-gray-500 shrink-0">{label}</div>
+        <div className="break-all">{toPreview(value)}</div>
+      </div>
+    );
+  }
+
+  const entries: Array<[string, any]> = Array.isArray(value)
+    ? value.map((v: any, i: number) => [String(i), v])
+    : Object.entries(value || {});
+
+  const maxShown = depth >= 3 ? 20 : 60;
+  const shown = entries.slice(0, maxShown);
+  const rest = entries.length - shown.length;
+
+  return (
+    <details className="rounded-xl border border-gray-100 bg-white/60 p-3" open={depth < 1}>
+      <summary className="cursor-pointer select-none text-sm font-semibold text-brand-text">
+        {label}
+        <span className="text-gray-500 font-normal">{toPreview(value)}</span>
+      </summary>
+      <div className="mt-3 space-y-2">
+        {shown.map(([k, v]) => (
+          <div key={`${depth}-${k}`} className="pl-3 border-l border-gray-100">
+            <JsonNode name={k} value={v} depth={depth + 1} />
+          </div>
+        ))}
+        {rest > 0 && <div className="text-xs text-gray-500">已折叠 {rest} 个字段（层级较深时默认只展示部分）</div>}
+      </div>
+    </details>
+  );
+}
+
+export function PrettyJsonViewer({
+  value,
+  defaultMode = 'fields',
+  className = '',
+}: {
+  value: any;
+  defaultMode?: 'fields' | 'pretty';
+  className?: string;
+}) {
+  const [mode, setMode] = useState<'fields' | 'pretty'>(defaultMode);
+  const parsed = useMemo(() => safeJsonParse(value), [value]);
+  const displayValue = parsed.value;
+  const isJson = parsed.ok && typeof displayValue === 'object' && displayValue != null;
+
+  return (
+    <div className={className}>
+      <div className="flex items-center justify-between gap-3">
+        <div className="text-sm font-semibold text-gray-700">
+          {isJson ? 'JSON 结果' : '结果文本'}
+          {!parsed.ok && <span className="ml-2 text-xs text-gray-500">不是标准 JSON，已按文本展示</span>}
+          {!!parsed.normalized && <span className="ml-2 text-xs text-gray-500">已自动修复常见格式</span>}
+        </div>
+        <div className="flex gap-2">
+          <Button type="button" variant={mode === 'fields' ? 'primary' : 'secondary'} onClick={() => setMode('fields')}>
+            字段
+          </Button>
+          <Button type="button" variant={mode === 'pretty' ? 'primary' : 'secondary'} onClick={() => setMode('pretty')}>
+            原始
+          </Button>
+        </div>
+      </div>
+
+      <div className="mt-3">
+        {mode === 'pretty' && (
+          <pre className="text-xs leading-relaxed bg-gray-50 border border-gray-200 rounded-xl p-4 overflow-auto whitespace-pre-wrap break-words font-mono text-gray-700">
+            {typeof displayValue === 'string' ? displayValue : JSON.stringify(displayValue, null, 2)}
+          </pre>
+        )}
+        {mode === 'fields' && (
+          <div className="space-y-2">
+            {isJson ? <JsonNode value={displayValue as JsonLike} depth={0} /> : <div className="text-sm break-words">{toPreview(displayValue)}</div>}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

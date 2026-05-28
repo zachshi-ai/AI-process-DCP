@@ -1,0 +1,272 @@
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+from typing import List, Optional, Dict
+from crawler import WebCrawler
+from config_manager import ConfigManager
+from secret_store import SecretStore
+from llm_processor import LLMProcessor
+from plugin_manager import PluginManager
+from batch_processor import BatchProcessor
+from logger_setup import global_logger as logger
+import os
+import time
+import shutil
+from cryptography.fernet import Fernet
+from fastapi.middleware.cors import CORSMiddleware
+from urllib.parse import urlparse
+from history_store import HistoryStore
+from drill_store import DrillStore
+from path_opener import open_in_file_manager, PathOpenError
+import sqlite3
+
+app = FastAPI(title="AI-DCP Backend")
+
+# 允许跨域请求
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 基础目录及配置管理实例
+BASE_DIR = os.environ.get("AI_DCP_BASE_DIR") or os.path.dirname(__file__)
+USER_DATA_DIR = os.environ.get("AI_DCP_USER_DATA_DIR") or os.path.join(BASE_DIR, "data")
+
+CONFIG_DIR = os.path.join(BASE_DIR, "config")
+PLUGIN_DIR = os.path.join(BASE_DIR, "plugins")
+DATA_DIR = os.path.join(USER_DATA_DIR, "data")
+OUTPUT_DIR = os.path.join(USER_DATA_DIR, "output")
+LOG_DIR = os.path.join(USER_DATA_DIR, "logs")
+
+os.makedirs(os.path.join(CONFIG_DIR, "skill"), exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+config_manager = ConfigManager(CONFIG_DIR)
+secret_store = SecretStore(
+    key_path=os.path.join(USER_DATA_DIR, "secret.key"),
+    store_path=os.path.join(USER_DATA_DIR, "llm_config.enc"),
+)
+
+
+def _maybe_migrate_legacy_llm_config():
+    legacy_key_path = os.path.join(BASE_DIR, "secret.key")
+    legacy_store_path = os.path.join(BASE_DIR, "llm_config.enc")
+    target_key_path = secret_store.key_path
+    target_store_path = secret_store.store_path
+
+    if not os.path.exists(legacy_store_path) or not os.path.exists(legacy_key_path):
+        return
+
+    loaded = secret_store.load_config()
+    if loaded:
+        return
+
+    try:
+        with open(legacy_store_path, "rb") as f:
+            legacy_store_bytes = f.read()
+    except Exception:
+        return
+
+    try:
+        secret_store.cipher.decrypt(legacy_store_bytes)
+        os.makedirs(os.path.dirname(target_store_path), exist_ok=True)
+        if os.path.exists(target_store_path):
+            os.replace(target_store_path, f"{target_store_path}.bak.{int(time.time())}")
+        with open(target_store_path, "wb") as f:
+            f.write(legacy_store_bytes)
+        return
+    except Exception:
+        pass
+
+    try:
+        with open(legacy_key_path, "rb") as f:
+            legacy_key_bytes = f.read()
+        legacy_cipher = Fernet(legacy_key_bytes)
+        legacy_cipher.decrypt(legacy_store_bytes)
+
+        os.makedirs(os.path.dirname(target_key_path), exist_ok=True)
+        if os.path.exists(target_key_path):
+            os.replace(target_key_path, f"{target_key_path}.bak.{int(time.time())}")
+        with open(target_key_path, "wb") as f:
+            f.write(legacy_key_bytes)
+
+        secret_store.key = legacy_key_bytes
+        secret_store.cipher = legacy_cipher
+
+        os.makedirs(os.path.dirname(target_store_path), exist_ok=True)
+        if os.path.exists(target_store_path):
+            os.replace(target_store_path, f"{target_store_path}.bak.{int(time.time())}")
+        with open(target_store_path, "wb") as f:
+            f.write(legacy_store_bytes)
+    except Exception:
+        return
+
+
+_maybe_migrate_legacy_llm_config()
+
+
+def _count_rows(db_path: str, table: str) -> Optional[int]:
+    if not os.path.exists(db_path):
+        return None
+    try:
+        con = sqlite3.connect(db_path)
+        cur = con.cursor()
+        cur.execute(f"select count(*) from {table}")
+        n = cur.fetchone()[0]
+        con.close()
+        return int(n)
+    except Exception:
+        return None
+
+
+def _maybe_migrate_legacy_history_and_drill_db():
+    legacy_history = os.path.join(USER_DATA_DIR, "history.db")
+    legacy_drill = os.path.join(USER_DATA_DIR, "drill.db")
+    target_history = os.path.join(DATA_DIR, "history.db")
+    target_drill = os.path.join(DATA_DIR, "drill.db")
+
+    def copy_if_needed(legacy_path: str, target_path: str, table: str):
+        if not os.path.exists(legacy_path):
+            return
+
+        legacy_count = _count_rows(legacy_path, table)
+        if legacy_count is None or legacy_count <= 0:
+            return
+
+        target_count = _count_rows(target_path, table)
+        if target_count is not None and target_count >= legacy_count:
+            return
+
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        if os.path.exists(target_path):
+            os.replace(target_path, f"{target_path}.bak.{int(time.time())}")
+        os.replace(legacy_path, target_path)
+
+    copy_if_needed(legacy_history, target_history, "history_events")
+    copy_if_needed(legacy_drill, target_drill, "drill_sessions")
+
+
+_maybe_migrate_legacy_history_and_drill_db()
+plugin_manager = PluginManager(PLUGIN_DIR)
+
+history_store = HistoryStore(os.path.join(DATA_DIR, "history.db"))
+drill_store = DrillStore(os.path.join(DATA_DIR, "drill.db"))
+
+# 初始化一些示例配置
+agent_md_path = os.path.join(CONFIG_DIR, "Agent.md")
+if not os.path.exists(agent_md_path):
+    with open(agent_md_path, "w", encoding="utf-8") as f:
+        f.write("# Agent Role\n你是一个强大的 AI 知识提取与分析助手。请根据抓取的内容进行总结分析。")
+
+
+class LLMConfig(BaseModel):
+    api_token: str
+    base_url: str
+    model: str
+    timeout: int = 60
+    retry: int = 3
+
+
+class CrawlRequest(BaseModel):
+    url: str
+    max_depth: int = 3
+    headless: bool = True
+    skill_name: Optional[str] = "summary"
+    custom_skill_content: Optional[str] = None
+
+
+class BatchRequest(BaseModel):
+    urls: List[str]
+    custom_skills: Optional[Dict[str, str]] = None
+    drill_config: Optional[Dict[str, object]] = None
+    skill_name: Optional[str] = None
+
+
+class HistoryOpenRequest(BaseModel):
+    event_id: int
+
+
+class DrillStartRequest(BaseModel):
+    url: str
+    max_depth: int = 5
+
+
+class DrillNavigateRequest(BaseModel):
+    session_id: str
+    url: str
+
+
+class DrillBackRequest(BaseModel):
+    session_id: str
+
+
+class AuthStartRequest(BaseModel):
+    force: bool = False
+
+
+@app.get("/")
+def read_root():
+    return {"status": "ok", "message": "AI-DCP Backend is running!"}
+
+
+@app.post("/api/llm/config")
+def save_llm_config(config: LLMConfig):
+    """
+    保存 LLM 连接配置信息到本地加密存储
+    """
+    existing = secret_store.load_config()
+    merged = dict(existing)
+    merged.update(config.dict())
+    secret_store.save_config(merged)
+    return {"status": "success", "message": "配置保存成功"}
+
+
+@app.get("/api/llm/config")
+def get_llm_config():
+    """
+    获取当前解密后的 LLM 连接配置信息（不包含真实 token）
+    """
+    config = secret_store.load_config()
+    if "api_token" in config:
+        config["api_token"] = "********"  # 返回打码后的结果保证安全
+    return config
+
+
+@app.get("/api/skills")
+def get_skills():
+    """
+    获取所有可用的技能模板列表
+    """
+    skills = config_manager.list_skills()
+    return {"skills": skills}
+
+
+@app.post("/api/auth/start")
+async def start_auth(req: Optional[AuthStartRequest] = None):
+    """
+    首次运行，启动可见浏览器让用户登录
+    """
+    force = bool(req and req.force)
+    if secret_store.get_auth_status() and not force:
+        return {"status": "success", "message": "已经授权过，无需再次授权"}
+
+    try:
+        if force:
+            secret_store.set_auth_status(False)
+            profile_dir = os.path.join(USER_DATA_DIR, "browser_profile")
+            try:
+                shutil.rmtree(profile_dir)
+            except Exception:
+                pass
+        crawler = WebCrawler(start_url="https://oa.ksyun.com", max_depth=1, headless=False)
+        await crawler.run()
+        secret_store.set_auth_status(True)
+        return {"status": "success", "message": "授权状态已永久保存"}
+    except Exception as e:
+        logger.error(f"授权过程出错: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+

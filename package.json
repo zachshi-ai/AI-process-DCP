@@ -1,0 +1,42 @@
+{
+  "name": "ai-dcp-desktop",
+  "version": "1.0.0",
+  "description": "AI-DCP Desktop Application",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder"
+  },
+  "build": {
+    "appId": "com.ai-dcp.desktop",
+    "productName": "AI-DCP",
+    "asar": true,
+    "asarUnpack": [
+      "backend/**/*",
+      "frontend/**/*"
+    ],
+    "mac": {
+      "target": ["zip"],
+      "icon": "assets/icon.icns",
+      "category": "public.app-category.utilities",
+      "hardenedRuntime": true,
+      "entitlements": "entitlements.mac.plist",
+      "entitlementsInherit": "entitlements.mac.plist"
+    }
+  },
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.0.0"
+  },
+  "dependencies": {
+    "child_process": "^1.0.2",
+    "express": "^4.18.2"
+  },
+  "files": [
+    "main.js",
+    "frontend/**/*",
+    "backend/**/*",
+    "assets/**/*",
+    "entitlements.mac.plist"
+  ]
+}

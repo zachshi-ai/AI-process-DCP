@@ -1,0 +1,723 @@
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+from typing import List, Optional, Dict
+from crawler import WebCrawler
+from config_manager import ConfigManager
+from secret_store import SecretStore
+from llm_processor import LLMProcessor
+from plugin_manager import PluginManager
+from batch_processor import BatchProcessor
+from logger_setup import global_logger as logger
+import os
+import time
+import asyncio
+import shutil
+from cryptography.fernet import Fernet
+from fastapi.middleware.cors import CORSMiddleware
+from urllib.parse import urlparse
+from history_store import HistoryStore
+from drill_store import DrillStore
+from path_opener import open_in_file_manager, PathOpenError
+import sqlite3
+
+app = FastAPI(title="AI-DCP Backend")
+
+# 允许跨域请求
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 基础目录及配置管理实例
+BASE_DIR = os.environ.get("AI_DCP_BASE_DIR") or os.path.dirname(__file__)
+USER_DATA_DIR = os.environ.get("AI_DCP_USER_DATA_DIR") or os.path.join(BASE_DIR, "data")
+
+CONFIG_DIR = os.path.join(BASE_DIR, "config")
+PLUGIN_DIR = os.path.join(BASE_DIR, "plugins")
+DATA_DIR = os.path.join(USER_DATA_DIR, "data")
+OUTPUT_DIR = os.path.join(USER_DATA_DIR, "output")
+LOG_DIR = os.path.join(USER_DATA_DIR, "logs")
+
+os.makedirs(os.path.join(CONFIG_DIR, "skill"), exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+config_manager = ConfigManager(CONFIG_DIR)
+secret_store = SecretStore(
+    key_path=os.path.join(USER_DATA_DIR, "secret.key"),
+    store_path=os.path.join(USER_DATA_DIR, "llm_config.enc"),
+)
+
+
+def _maybe_migrate_legacy_llm_config():
+    legacy_key_path = os.path.join(BASE_DIR, "secret.key")
+    legacy_store_path = os.path.join(BASE_DIR, "llm_config.enc")
+    target_key_path = secret_store.key_path
+    target_store_path = secret_store.store_path
+
+    if not os.path.exists(legacy_store_path) or not os.path.exists(legacy_key_path):
+        return
+
+    loaded = secret_store.load_config()
+    if loaded:
+        return
+
+    try:
+        with open(legacy_store_path, "rb") as f:
+            legacy_store_bytes = f.read()
+    except Exception:
+        return
+
+    try:
+        secret_store.cipher.decrypt(legacy_store_bytes)
+        os.makedirs(os.path.dirname(target_store_path), exist_ok=True)
+        if os.path.exists(target_store_path):
+            os.replace(target_store_path, f"{target_store_path}.bak.{int(time.time())}")
+        with open(target_store_path, "wb") as f:
+            f.write(legacy_store_bytes)
+        return
+    except Exception:
+        pass
+
+    try:
+        with open(legacy_key_path, "rb") as f:
+            legacy_key_bytes = f.read()
+        legacy_cipher = Fernet(legacy_key_bytes)
+        legacy_cipher.decrypt(legacy_store_bytes)
+
+        os.makedirs(os.path.dirname(target_key_path), exist_ok=True)
+        if os.path.exists(target_key_path):
+            os.replace(target_key_path, f"{target_key_path}.bak.{int(time.time())}")
+        with open(target_key_path, "wb") as f:
+            f.write(legacy_key_bytes)
+
+        secret_store.key = legacy_key_bytes
+        secret_store.cipher = legacy_cipher
+
+        os.makedirs(os.path.dirname(target_store_path), exist_ok=True)
+        if os.path.exists(target_store_path):
+            os.replace(target_store_path, f"{target_store_path}.bak.{int(time.time())}")
+        with open(target_store_path, "wb") as f:
+            f.write(legacy_store_bytes)
+    except Exception:
+        return
+
+
+_maybe_migrate_legacy_llm_config()
+
+
+def _count_rows(db_path: str, table: str) -> Optional[int]:
+    if not os.path.exists(db_path):
+        return None
+    try:
+        con = sqlite3.connect(db_path)
+        cur = con.cursor()
+        cur.execute(f"select count(*) from {table}")
+        n = cur.fetchone()[0]
+        con.close()
+        return int(n)
+    except Exception:
+        return None
+
+
+def _maybe_migrate_legacy_history_and_drill_db():
+    legacy_history = os.path.join(USER_DATA_DIR, "history.db")
+    legacy_drill = os.path.join(USER_DATA_DIR, "drill.db")
+    target_history = os.path.join(DATA_DIR, "history.db")
+    target_drill = os.path.join(DATA_DIR, "drill.db")
+
+    def copy_if_needed(legacy_path: str, target_path: str, table: str):
+        if not os.path.exists(legacy_path):
+            return
+
+        legacy_count = _count_rows(legacy_path, table)
+        if legacy_count is None or legacy_count <= 0:
+            return
+
+        target_count = _count_rows(target_path, table)
+        if target_count is not None and target_count >= legacy_count:
+            return
+
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        if os.path.exists(target_path):
+            os.replace(target_path, f"{target_path}.bak.{int(time.time())}")
+        os.replace(legacy_path, target_path)
+
+    copy_if_needed(legacy_history, target_history, "history_events")
+    copy_if_needed(legacy_drill, target_drill, "drill_sessions")
+
+
+_maybe_migrate_legacy_history_and_drill_db()
+plugin_manager = PluginManager(PLUGIN_DIR)
+
+history_store = HistoryStore(os.path.join(DATA_DIR, "history.db"))
+drill_store = DrillStore(os.path.join(DATA_DIR, "drill.db"))
+
+# 初始化一些示例配置
+agent_md_path = os.path.join(CONFIG_DIR, "Agent.md")
+if not os.path.exists(agent_md_path):
+    with open(agent_md_path, "w", encoding="utf-8") as f:
+        f.write("# Agent Role\n你是一个强大的 AI 知识提取与分析助手。请根据抓取的内容进行总结分析。")
+
+
+class LLMConfig(BaseModel):
+    api_token: str
+    base_url: str
+    model: str
+    timeout: int = 60
+    retry: int = 3
+
+
+class CrawlRequest(BaseModel):
+    url: str
+    max_depth: int = 3
+    headless: bool = True
+    skill_name: Optional[str] = "summary"
+    custom_skill_content: Optional[str] = None
+
+
+class BatchRequest(BaseModel):
+    urls: List[str]
+    custom_skills: Optional[Dict[str, str]] = None
+    drill_config: Optional[Dict[str, object]] = None
+    skill_name: Optional[str] = None
+
+
+class HistoryOpenRequest(BaseModel):
+    event_id: int
+
+
+class DrillStartRequest(BaseModel):
+    url: str
+    max_depth: int = 5
+
+
+class DrillNavigateRequest(BaseModel):
+    session_id: str
+    url: str
+
+
+class DrillBackRequest(BaseModel):
+    session_id: str
+
+
+class AuthStartRequest(BaseModel):
+    force: bool = False
+
+
+def _looks_like_login_page(title: str, content: str, final_url: str) -> bool:
+    t = (title or "").lower()
+    u = (final_url or "").lower()
+    c = (content or "").lower()
+    if any(x in u for x in ["login", "sso", "cas", "passport"]):
+        return True
+    if any(x in t for x in ["登录", "login", "sign in", "统一身份", "单点"]):
+        return True
+    if any(x in c for x in ["用户名", "密码", "验证码", "扫码登录", "单点登录", "统一身份认证", "login"]):
+        return True
+    return False
+
+
+@app.get("/")
+def read_root():
+    return {"status": "ok", "message": "AI-DCP Backend is running!"}
+
+
+@app.post("/api/llm/config")
+def save_llm_config(config: LLMConfig):
+    """
+    保存 LLM 连接配置信息到本地加密存储
+    """
+    existing = secret_store.load_config()
+    merged = dict(existing)
+    merged.update(config.dict())
+    secret_store.save_config(merged)
+    return {"status": "success", "message": "配置保存成功"}
+
+
+@app.get("/api/llm/config")
+def get_llm_config():
+    """
+    获取当前解密后的 LLM 连接配置信息（不包含真实 token）
+    """
+    config = secret_store.load_config()
+    if "api_token" in config:
+        config["api_token"] = "********"  # 返回打码后的结果保证安全
+    return config
+
+
+@app.get("/api/skills")
+def get_skills():
+    """
+    获取所有可用的技能模板列表
+    """
+    skills = config_manager.list_skills()
+    return {"skills": skills}
+
+
+@app.post("/api/auth/start")
+async def start_auth(req: Optional[AuthStartRequest] = None):
+    """
+    首次运行，启动可见浏览器让用户登录
+    """
+    force = bool(req and req.force)
+    if secret_store.get_auth_status() and not force:
+        return {"status": "success", "message": "已经授权过，无需再次授权"}
+
+    try:
+        if force:
+            secret_store.set_auth_status(False)
+            profile_dir = os.path.join(USER_DATA_DIR, "browser_profile")
+            try:
+                shutil.rmtree(profile_dir)
+            except Exception:
+                pass
+        # 打开一个无意义但能调起浏览器的起始页
+        crawler = WebCrawler(start_url="https://oa.ksyun.com", max_depth=1, headless=False)
+        await crawler.run()
+        verifier = WebCrawler(start_url="https://oa.ksyun.com", max_depth=1, headless=True)
+        last_err: Optional[Exception] = None
+        for _ in range(3):
+            try:
+                data = await verifier.get_page_snapshot("https://oa.ksyun.com")
+                if _looks_like_login_page(data.get("title", ""), data.get("content", ""), data.get("url", "")):
+                    secret_store.set_auth_status(False)
+                    raise HTTPException(status_code=400, detail="检测到仍未登录。请在弹出的窗口完成登录后，再关闭窗口。")
+                secret_store.set_auth_status(True)
+                return {"status": "success", "message": "授权已保存，可直接访问需要登录的页面"}
+            except HTTPException:
+                raise
+            except Exception as e:
+                last_err = e
+                await asyncio.sleep(0.6)
+
+        secret_store.set_auth_status(True)
+        msg = "授权窗口已关闭，凭证已保存；暂时无法自动校验登录态，请直接发起一次批量任务验证。"
+        if last_err is not None:
+            msg = f"{msg}（校验错误：{last_err}）"
+        return {"status": "success", "message": msg}
+    except Exception as e:
+        logger.error(f"授权过程出错: {e}")
+        if isinstance(e, TimeoutError):
+            raise HTTPException(status_code=409, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/auth/status")
+def get_auth_status():
+    return {
+        "authorized": bool(secret_store.get_auth_status()),
+        "user_data_dir": USER_DATA_DIR,
+        "profile_dir": os.path.join(USER_DATA_DIR, "browser_profile"),
+        "store_path": secret_store.store_path,
+    }
+
+
+@app.get("/api/auth/verify")
+async def verify_auth():
+    if not secret_store.get_auth_status():
+        return {"authorized": False, "status": "not_authorized"}
+    try:
+        verifier = WebCrawler(start_url="https://oa.ksyun.com", max_depth=1, headless=True)
+        data = await verifier.get_page_snapshot("https://oa.ksyun.com", lock_timeout_s=2)
+        if _looks_like_login_page(data.get("title", ""), data.get("content", ""), data.get("url", "")):
+            secret_store.set_auth_status(False)
+            return {"authorized": False, "status": "expired"}
+        return {"authorized": True, "status": "ok"}
+    except TimeoutError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        return {"authorized": bool(secret_store.get_auth_status()), "status": "unknown", "detail": str(e)}
+
+class HistoryImportRequest(BaseModel):
+    history_db_path: Optional[str] = None
+    drill_db_path: Optional[str] = None
+
+
+@app.post("/api/history/import-path")
+def import_history_from_path(req: HistoryImportRequest):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    result: Dict[str, object] = {"imported": [], "skipped": []}
+
+    def _backup_if_exists(dst: str) -> Optional[str]:
+        if not os.path.exists(dst):
+            return None
+        ts = str(int(time.time()))
+        bak = f"{dst}.bak.{ts}"
+        shutil.copy2(dst, bak)
+        return bak
+
+    def _count_table(db_path: str, table: str) -> int:
+        con = sqlite3.connect(db_path)
+        try:
+            cur = con.cursor()
+            cur.execute(f"select count(*) from {table}")
+            row = cur.fetchone()
+            return int(row[0] if row else 0)
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+
+    items = [
+        ("history", (req.history_db_path or "").strip(), os.path.join(DATA_DIR, "history.db"), "history_events"),
+        ("drill", (req.drill_db_path or "").strip(), os.path.join(DATA_DIR, "drill.db"), "drill_sessions"),
+    ]
+    for kind, src, dst_path, table in items:
+        if not src:
+            result["skipped"].append({"kind": kind, "reason": "no_path"})
+            continue
+        try:
+            if not os.path.exists(src):
+                raise FileNotFoundError(f"not_found:{src}")
+            if not os.path.isfile(src):
+                raise ValueError(f"not_a_file:{src}")
+            count = _count_table(src, table)
+            bak = _backup_if_exists(dst_path)
+            shutil.copy2(src, dst_path)
+            result["imported"].append({"kind": kind, "dst": dst_path, "backup": bak, "count": count})
+        except Exception as e:
+            result["skipped"].append({"kind": kind, "reason": str(e)})
+
+    return result
+
+
+@app.post("/api/task/batch")
+async def process_batch_tasks(req: BatchRequest, background_tasks: BackgroundTasks):
+    """
+    批量执行任务 API，检查是否授权，启动后台批处理任务
+    """
+    if any(urlparse(u).netloc.endswith("oa.ksyun.com") for u in (req.urls or []) if u):
+        if not secret_store.get_auth_status():
+            raise HTTPException(status_code=401, detail="首次运行请先点击右上角「手动授权访问」完成登录授权")
+        try:
+            verifier = WebCrawler(start_url="https://oa.ksyun.com", max_depth=1, headless=True)
+            data = await verifier.get_page_snapshot("https://oa.ksyun.com", lock_timeout_s=2)
+            if _looks_like_login_page(data.get("title", ""), data.get("content", ""), data.get("url", "")):
+                secret_store.set_auth_status(False)
+                raise HTTPException(status_code=401, detail="授权已失效，请点击右上角「手动授权访问」重新登录")
+        except HTTPException:
+            raise
+        except TimeoutError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        except Exception:
+            pass
+
+    llm_config = secret_store.load_config()
+    if not llm_config:
+        raise HTTPException(status_code=400, detail="LLM 配置未初始化，请先在设置中配置 API")
+
+    llm_processor = LLMProcessor(
+        api_token=llm_config.get("api_token", ""),
+        base_url=llm_config.get("base_url", ""),
+        model=llm_config.get("model", ""),
+        timeout=llm_config.get("timeout", 60),
+        retry=llm_config.get("retry", 3)
+    )
+
+    event_id = history_store.create_event(
+        kind="batch",
+        title="批量任务",
+        url=req.urls[0] if req.urls else "",
+        path=None,
+        meta={"count": len(req.urls)},
+    )
+    history_store.update_event(
+        event_id,
+        status="queued",
+        total=len(req.urls),
+        processed=0,
+        success=0,
+        failed=0,
+        updated_ts=int(time.time()),
+    )
+    processor = BatchProcessor(
+        config_manager,
+        llm_processor,
+        output_dir=OUTPUT_DIR,
+        history_store=history_store,
+        event_id=event_id,
+        drill_config=req.drill_config,
+        skill_name=req.skill_name,
+    )
+
+    # 将批处理任务放入后台运行，以防请求超时
+    background_tasks.add_task(processor.process_batch, req.urls, req.custom_skills)
+
+    return {
+        "status": "success",
+        "message": f"已将 {len(req.urls)} 个任务加入后台队列，结果将实时写入 {processor.excel_path}",
+        "report_path": processor.excel_path
+    }
+
+
+@app.get("/api/history/events")
+def list_history_events(q: Optional[str] = None, kind: Optional[str] = None, limit: int = 50, offset: int = 0):
+    events = history_store.list_events(q=q, kind=kind, limit=limit, offset=offset)
+    return {
+        "events": [
+            {
+                "id": e.id,
+                "ts": e.ts,
+                "kind": e.kind,
+                "title": e.title,
+                "url": e.url,
+                "path": e.path,
+                "status": e.status,
+                "updated_ts": e.updated_ts,
+                "started_ts": e.started_ts,
+                "finished_ts": e.finished_ts,
+                "total": e.total,
+                "processed": e.processed,
+                "success": e.success,
+                "failed": e.failed,
+                "meta": e.meta,
+            }
+            for e in events
+        ]
+    }
+
+
+@app.get("/api/history/events/{event_id}")
+def get_history_event(event_id: int):
+    event = history_store.get_event(event_id)
+    if not event:
+        raise HTTPException(status_code=404, detail="未找到历史记录")
+    items = history_store.list_items(event_id)
+    return {
+        "event": {
+            "id": event.id,
+            "ts": event.ts,
+            "kind": event.kind,
+            "title": event.title,
+            "url": event.url,
+            "path": event.path,
+            "status": event.status,
+            "updated_ts": event.updated_ts,
+            "started_ts": event.started_ts,
+            "finished_ts": event.finished_ts,
+            "total": event.total,
+            "processed": event.processed,
+            "success": event.success,
+            "failed": event.failed,
+            "meta": event.meta,
+        },
+        "items": [
+            {
+                "id": i.id,
+                "ts": i.ts,
+                "url": i.url,
+                "skill": i.skill,
+                "evidence": i.evidence,
+                "result": i.result,
+                "status": i.status,
+                "meta": i.meta,
+            }
+            for i in items
+        ],
+    }
+
+
+@app.post("/api/history/open")
+def open_history_path(req: HistoryOpenRequest):
+    event = history_store.get_event(req.event_id)
+    if not event or not event.path:
+        raise HTTPException(status_code=404, detail="该记录没有可打开的路径")
+    try:
+        open_in_file_manager(event.path, [OUTPUT_DIR, LOG_DIR, os.path.join(os.path.dirname(__file__), "docs")])
+    except PathOpenError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "success"}
+
+
+@app.post("/api/drill/start")
+async def drill_start(req: DrillStartRequest):
+    parsed = urlparse(req.url)
+    if parsed.scheme not in ["http", "https"]:
+        raise HTTPException(status_code=400, detail="URL 格式不正确")
+    if parsed.netloc.endswith("oa.ksyun.com"):
+        if not secret_store.get_auth_status():
+            raise HTTPException(status_code=401, detail="首次运行请先完成浏览器授权")
+        try:
+            verifier = WebCrawler(start_url="https://oa.ksyun.com", max_depth=1, headless=True)
+            data = await verifier.get_page_snapshot("https://oa.ksyun.com")
+            if _looks_like_login_page(data.get("title", ""), data.get("content", ""), data.get("url", "")):
+                secret_store.set_auth_status(False)
+                raise HTTPException(status_code=401, detail="授权已失效，请重新点击「手动授权访问」完成登录")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+    max_depth = max(1, min(int(req.max_depth), 5))
+    event_id = history_store.create_event(
+        kind="drill",
+        title="网页下钻",
+        url=req.url,
+        meta={"max_depth": max_depth},
+    )
+    session_id = drill_store.create_session(max_depth=max_depth, event_id=event_id)
+    crawler = WebCrawler(start_url=req.url, max_depth=max_depth, headless=True)
+    page_data = await crawler.get_page_snapshot(req.url)
+    if parsed.netloc.endswith("oa.ksyun.com") and not (page_data.get("content") or "").strip():
+        try:
+            headful = WebCrawler(start_url=req.url, max_depth=max_depth, headless=False)
+            page2 = await headful.get_page_snapshot(req.url)
+            if (page2.get("content") or "").strip():
+                page_data = page2
+        except Exception:
+            pass
+    if parsed.netloc.endswith("oa.ksyun.com") and _looks_like_login_page(
+        page_data.get("title", ""), page_data.get("content", ""), page_data.get("url", "")
+    ):
+        secret_store.set_auth_status(False)
+        raise HTTPException(status_code=401, detail="检测到当前页面仍为登录页，请重新完成登录授权后再下钻")
+    stack = [page_data]
+    drill_store.save_stack(session_id, stack)
+    history_store.add_item(event_id, req.url, "", "打开页面", page_data.get("title", ""), "visited")
+    return {"session_id": session_id, "max_depth": max_depth, "stack": stack}
+
+
+@app.post("/api/drill/navigate")
+async def drill_navigate(req: DrillNavigateRequest):
+    parsed = urlparse(req.url)
+    if parsed.scheme not in ["http", "https"]:
+        raise HTTPException(status_code=400, detail="URL 格式不正确")
+    session = drill_store.get_session(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    if len(session.stack) >= session.max_depth:
+        raise HTTPException(status_code=400, detail="已达到最大下钻深度")
+    if parsed.netloc.endswith("oa.ksyun.com"):
+        if not secret_store.get_auth_status():
+            raise HTTPException(status_code=401, detail="授权已失效，请重新点击「手动授权访问」完成登录")
+        try:
+            verifier = WebCrawler(start_url="https://oa.ksyun.com", max_depth=1, headless=True)
+            data = await verifier.get_page_snapshot("https://oa.ksyun.com")
+            if _looks_like_login_page(data.get("title", ""), data.get("content", ""), data.get("url", "")):
+                secret_store.set_auth_status(False)
+                raise HTTPException(status_code=401, detail="授权已失效，请重新点击「手动授权访问」完成登录")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+    crawler = WebCrawler(start_url=req.url, max_depth=session.max_depth, headless=True)
+    page_data = await crawler.get_page_snapshot(req.url)
+    if parsed.netloc.endswith("oa.ksyun.com") and not (page_data.get("content") or "").strip():
+        try:
+            headful = WebCrawler(start_url=req.url, max_depth=session.max_depth, headless=False)
+            page2 = await headful.get_page_snapshot(req.url)
+            if (page2.get("content") or "").strip():
+                page_data = page2
+        except Exception:
+            pass
+    if parsed.netloc.endswith("oa.ksyun.com") and _looks_like_login_page(
+        page_data.get("title", ""), page_data.get("content", ""), page_data.get("url", "")
+    ):
+        secret_store.set_auth_status(False)
+        raise HTTPException(status_code=401, detail="检测到当前页面仍为登录页，请重新完成登录授权后再继续下钻")
+    stack = list(session.stack) + [page_data]
+    drill_store.save_stack(req.session_id, stack)
+    history_store.add_item(session.event_id, req.url, "", "导航进入", page_data.get("title", ""), "visited")
+    return {"session_id": req.session_id, "max_depth": session.max_depth, "stack": stack}
+
+
+@app.post("/api/drill/back")
+def drill_back(req: DrillBackRequest):
+    session = drill_store.get_session(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    if len(session.stack) <= 1:
+        return {"session_id": req.session_id, "max_depth": session.max_depth, "stack": session.stack}
+    stack = list(session.stack[:-1])
+    drill_store.save_stack(req.session_id, stack)
+    return {"session_id": req.session_id, "max_depth": session.max_depth, "stack": stack}
+
+
+@app.get("/api/drill/session/{session_id}")
+def drill_get_session(session_id: str):
+    session = drill_store.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return {"session_id": session_id, "max_depth": session.max_depth, "stack": session.stack}
+
+
+@app.post("/api/task/process")
+async def process_task(req: CrawlRequest):
+    """
+    核心业务流程：接收 URL -> 爬取网页内容 -> 读取本地配置 -> 拼装 Prompt -> 调用 LLM -> 返回结果
+    """
+    # 1. 初始化爬虫并抓取网页
+    crawler = WebCrawler(
+        start_url=req.url,
+        max_depth=req.max_depth,
+        headless=req.headless
+    )
+    try:
+        results = await crawler.run()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"网页抓取失败: {str(e)}")
+
+    if not results:
+        raise HTTPException(status_code=404, detail="未抓取到有效内容")
+
+    # 提取所有抓取内容的文本部分合并
+    combined_content = "\n\n".join([item["content"] for item in results])
+
+    # 2. 读取本地配置拼装最终 Prompt
+    try:
+        # 执行插件：在组装 Prompt 前允许插件修改或清洗抓取的内容
+        plugin_context = {"content": combined_content, "url": req.url}
+        processed_context = plugin_manager.execute_plugins(plugin_context)
+        final_prompt = config_manager.build_final_prompt(
+            req.skill_name,
+            processed_context.get("content", combined_content),
+            req.custom_skill_content
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=400, detail=f"配置读取失败: {str(e)}")
+
+    # 3. 调用 LLM 服务进行智能处理
+    llm_config = secret_store.load_config()
+    if not llm_config:
+        raise HTTPException(status_code=400, detail="LLM 配置未初始化，请先在设置中配置 API")
+
+    llm_processor = LLMProcessor(**llm_config)
+
+    try:
+        llm_result = llm_processor.generate(final_prompt)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM 推理失败: {str(e)}")
+
+    evidence = ""
+    result = llm_result
+    try:
+        import json as _json
+        clean = str(llm_result or "").strip()
+        if "```" in clean:
+            clean = clean.replace("```json", "").replace("```JSON", "").replace("```", "").strip()
+        parsed = _json.loads(clean)
+        if isinstance(parsed, dict):
+            evidence = str(parsed.get("evidence", "") or "")[:200]
+            result = parsed.get("result", "")
+        else:
+            result = parsed
+    except Exception:
+        evidence = ""
+
+    return {
+        "status": "success",
+        "crawled_pages": len(results),
+        "evidence": evidence,
+        "result": result,
+        "raw": llm_result,
+    }
+
+# 确保在模块被直接运行时启动服务器
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1,0 +1,81 @@
+name: web-oneclick-windows-v1
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "web-oneclick-win-v1*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend dist
+        run: |
+          npm ci --prefix frontend
+          npm run --prefix frontend build
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps (runtime + build)
+        run: |
+          python -m pip install -U pip wheel setuptools
+          python -m pip install -r backend/requirements.runtime.v1.txt
+
+      - name: Install Playwright browsers (chromium)
+        run: |
+          python -m playwright install chromium
+
+      - name: Assemble oneclick folder
+        run: |
+          $ReleaseDir = "releases/web-oneclick-windows.v1"
+          New-Item -ItemType Directory -Force -Path $ReleaseDir | Out-Null
+          New-Item -ItemType Directory -Force -Path "$ReleaseDir/backend" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$ReleaseDir/frontend" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$ReleaseDir/data" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$ReleaseDir/.run" | Out-Null
+
+          Copy-Item -Force "releases/web-oneclick-windows.v1/start.bat" "$ReleaseDir/start.bat"
+          Copy-Item -Force "releases/web-oneclick-windows.v1/stop.bat" "$ReleaseDir/stop.bat"
+          Copy-Item -Force "releases/web-oneclick-windows.v1/README-运行说明-windows.md" "$ReleaseDir/README-运行说明-windows.md"
+
+          Copy-Item -Recurse -Force "frontend/dist" "$ReleaseDir/frontend/dist"
+
+      - name: Build backend exe (PyInstaller, webui)
+        run: |
+          pwsh -File desktop/scripts/build-backend-win-webui.v1.ps1 -PythonExe python -OutDir "releases/web-oneclick-windows.v1/backend"
+
+      - name: Copy Playwright browsers into bundle
+        run: |
+          pwsh -File desktop/scripts/copy-playwright-browsers-win.v1.ps1 -TargetDir "releases/web-oneclick-windows.v1/ms-playwright"
+
+      - name: Zip bundle
+        run: |
+          if (Test-Path "releases/web-oneclick-windows.v1.zip") { Remove-Item -Force "releases/web-oneclick-windows.v1.zip" }
+          Compress-Archive -Path "releases/web-oneclick-windows.v1/*" -DestinationPath "releases/web-oneclick-windows.v1.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-oneclick-windows.v1
+          path: |
+            releases/web-oneclick-windows.v1.zip
+            releases/web-oneclick-windows.v1/
+
