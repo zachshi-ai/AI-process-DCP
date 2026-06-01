@@ -33,3 +33,9 @@ desktop/
 **/secret.key
 **/secret.key.*
 **/*.key
+**/*.sqlite
+**/*.sqlite3
+**/*.db
+**/*.db-journal
+**/*.pem
+**/*.p12
