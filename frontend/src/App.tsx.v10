@@ -1,0 +1,1106 @@
+import React, { useState, useEffect } from 'react';
+import axios from 'axios';
+import { Settings, Globe, CheckCircle, AlertCircle, FolderOpen, List, TerminalSquare, Power, Activity } from 'lucide-react';
+import { Button } from './components/ui/Button';
+import { Card } from './components/ui/Card';
+import { Input } from './components/ui/Input';
+import { getDesktopApi, isDesktopApp } from './desktop';
+
+const API_BASE =
+  (window as any).__AI_DCP_API_BASE ||
+  (import.meta as any).env?.VITE_API_BASE ||
+  'http://localhost:8000';
+
+const normalizeApiBase = (v: string) => (v || '').trim().replace(/\/+$/, '');
+const WEB_API_BASE_STORAGE_KEY = 'AI_DCP_API_BASE';
+
+const isValidApiBase = (v: string) => {
+  try {
+    const u = new URL(normalizeApiBase(v));
+    const port = Number(u.port);
+    if (!u.protocol || (u.protocol !== 'http:' && u.protocol !== 'https:')) return false;
+    if (!Number.isFinite(port) || port <= 0) return false;
+    return true;
+  } catch (_) {
+    return false;
+  }
+};
+
+const formatBackendStartHelp = (base: string) => {
+  const clean = normalizeApiBase(base) || 'http://127.0.0.1:8000';
+  return [
+    '后端连接失败（Network Error），通常是后端没启动或端口不对。',
+    '',
+    `1) 先确认后端能打开：${clean}/`,
+    '2) 如果打不开，请在终端执行：',
+    '   cd /Users/kc-zach/Documents/trae_projects/AI-DCP/backend',
+    '   ./venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000',
+    '',
+    '如果你不想记命令：可以直接双击运行：',
+    '   AI-DCP/tools/web/start.command',
+  ].join('\n');
+};
+
+const isNetworkError = (err: any) => {
+  const msg = err?.message || '';
+  return !err?.response && String(msg || '').toLowerCase().includes('network');
+};
+
+function App() {
+  const [activeTab, setActiveTab] = useState('process');
+  const [apiBase, setApiBase] = useState<string>(API_BASE);
+  const [authLoading, setAuthLoading] = useState(false);
+  
+  // Backend service state
+  const [backendRunning, setBackendRunning] = useState(false);
+  const [backendLoading, setBackendLoading] = useState(false);
+  const [backendStatus, setBackendStatus] = useState<any>(null);
+  const [logLevel, setLogLevel] = useState<'all' | 'stdout' | 'stderr'>('all');
+  const [logKeyword, setLogKeyword] = useState('');
+  const [logs, setLogs] = useState<any[]>([]);
+  const [metrics, setMetrics] = useState<any>(null);
+  
+  // Custom skills from local folder
+  const [customSkills, setCustomSkills] = useState<{name: string, content: string}[]>([]);
+  const [selectedSkillName, setSelectedSkillName] = useState<string>('');
+  
+  // LLM Config state
+  const [config, setConfig] = useState({
+    api_token: '',
+    base_url: 'https://api.openai.com',
+    model: 'gpt-3.5-turbo',
+    timeout: 60,
+    retry: 3,
+    authorized: false
+  });
+  const [configStatus, setConfigStatus] = useState('');
+
+  // Process state
+  const [batchInput, setBatchInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState<any>(null);
+  const [error, setError] = useState('');
+  const [authModal, setAuthModal] = useState(false);
+  const [historyQuery, setHistoryQuery] = useState('');
+  const [historyEvents, setHistoryEvents] = useState<any[]>([]);
+  const [historySelected, setHistorySelected] = useState<any>(null);
+  const [historyItems, setHistoryItems] = useState<any[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [drillEnabled, setDrillEnabled] = useState(false);
+  const [drillDepth, setDrillDepth] = useState(3);
+
+  // 初始化加载数据
+  useEffect(() => {
+    if (isDesktopApp()) return;
+    try {
+      const v = (localStorage.getItem(WEB_API_BASE_STORAGE_KEY) || '').trim();
+      if (v) setApiBase(v);
+    } catch (_) {}
+  }, []);
+
+  useEffect(() => {
+    if (isDesktopApp()) return;
+    try {
+      localStorage.setItem(WEB_API_BASE_STORAGE_KEY, apiBase);
+    } catch (_) {}
+  }, [apiBase]);
+
+  useEffect(() => {
+    // 获取保存的 LLM 配置
+    const fetchConfig = async () => {
+      try {
+        const base = normalizeApiBase(apiBase);
+        const res = await axios.get(`${base}/api/llm/config`);
+        if (Object.keys(res.data).length > 0) {
+          setConfig(prev => ({ ...prev, ...res.data }));
+        }
+      } catch (err) {
+        console.error("无法获取配置", err);
+      }
+    };
+
+    if (!isValidApiBase(apiBase)) return;
+    if (isDesktopApp() && backendStatus?.state !== 'running') return;
+    fetchConfig();
+  }, [apiBase, backendStatus?.state]);
+
+  useEffect(() => {
+    if (!isDesktopApp()) return;
+    const api = getDesktopApi();
+    if (!api) return;
+    let cancel = false;
+    const refresh = async () => {
+      try {
+        const st = await api.getBackendStatus();
+        if (cancel) return;
+        setBackendStatus(st);
+        setBackendRunning(st?.state === 'running');
+        if (st?.apiBase) setApiBase(st.apiBase);
+      } catch (_) {}
+    };
+    refresh();
+    const unsub = api.onBackendStatus((st: any) => {
+      setBackendStatus(st);
+      setBackendRunning(st?.state === 'running');
+      setBackendLoading(false);
+      if (st?.apiBase) setApiBase(st.apiBase);
+    });
+    return () => {
+      cancel = true;
+      unsub?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isDesktopApp()) return;
+    const api = getDesktopApi();
+    if (!api) return;
+    const unsub = api.onBackendLog((log: any) => {
+      setLogs((prev) => {
+        const next = [...prev, log];
+        if (next.length > 2000) return next.slice(next.length - 2000);
+        return next;
+      });
+    });
+    return () => {
+      unsub?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isDesktopApp()) return;
+    const api = getDesktopApi();
+    if (!api) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const m = await api.getBackendMetrics();
+        if (cancelled) return;
+        setMetrics(m);
+      } catch (_) {}
+    };
+    tick();
+    const t = window.setInterval(tick, 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, []);
+
+  // 控制后端服务
+  const handleBackendToggle = () => {
+    const api = getDesktopApi();
+    if (!api) return;
+    setBackendLoading(true);
+    if (backendRunning) {
+      api.stopBackend().finally(() => setBackendLoading(false));
+    } else {
+      api.startBackend().finally(() => setBackendLoading(false));
+    }
+  };
+
+  const handleBackendRestart = () => {
+    const api = getDesktopApi();
+    if (!api) return;
+    setBackendLoading(true);
+    api.restartBackend().finally(() => setBackendLoading(false));
+  };
+
+  const handleOpenWebView = async () => {
+    const api = getDesktopApi();
+    if (!api) return;
+    await api.openWebView({ url: 'https://oa.ksyun.com' });
+  };
+
+  const handleBackendAuth = async (force: boolean) => {
+    setBackendLoading(true);
+    try {
+      await axios.post(`${apiBase}/api/auth/start`, force ? { force: true } : {});
+      alert('授权完成：已保存登录态。现在可以开始抓取内部页面。');
+    } catch (err: any) {
+      const msg = err?.response?.data?.detail || err?.message || '授权失败，请重试';
+      alert(msg);
+    } finally {
+      setBackendLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (activeTab !== 'history') return;
+
+    const mergeEvents = (prev: any[], incoming: any[]) => {
+      const map = new Map<number, any>();
+      prev.forEach(e => map.set(e.id, e));
+      incoming.forEach(e => {
+        const old = map.get(e.id) || {};
+        map.set(e.id, { ...old, ...e });
+      });
+      return Array.from(map.values()).sort((a, b) => (b.ts || 0) - (a.ts || 0));
+    };
+
+    const fetchHistory = async (silent: boolean) => {
+      if (!silent) setHistoryLoading(true);
+      try {
+        const res = await axios.get(`${apiBase}/api/history/events`, {
+          params: {
+            q: historyQuery || undefined,
+            limit: 50,
+            offset: 0,
+          }
+        });
+        const incoming = res.data.events || [];
+        setHistoryEvents(prev => mergeEvents(prev, incoming));
+        setHistorySelected((prev: any) => {
+          if (!prev) return prev;
+          const hit = incoming.find((e: any) => e.id === prev.id);
+          return hit ? { ...prev, ...hit } : prev;
+        });
+      } catch (err: any) {
+        setError(err.response?.data?.detail || err.message || '加载历史记录失败');
+      } finally {
+        if (!silent) setHistoryLoading(false);
+      }
+    };
+
+    fetchHistory(false);
+    const timer = window.setInterval(() => {
+      fetchHistory(true);
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [activeTab, historyQuery, apiBase]);
+
+  useEffect(() => {
+    if (activeTab !== 'history') return;
+    if (!historySelected?.id) return;
+    const shouldPoll = historySelected.status === 'running' || historySelected.status === 'queued';
+    if (!shouldPoll) return;
+    let cancelled = false;
+    const fetchDetail = async () => {
+      try {
+        const res = await axios.get(`${apiBase}/api/history/events/${historySelected.id}`);
+        if (cancelled) return;
+        setHistorySelected(res.data.event);
+        setHistoryItems(res.data.items || []);
+      } catch (err) {
+        return;
+      }
+    };
+    fetchDetail();
+    const t = window.setInterval(fetchDetail, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, [activeTab, historySelected?.id, historySelected?.status, apiBase]);
+
+  // 处理本地文件夹选择
+  const handleFolderSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files) return;
+
+    const map: Record<string, { skillMd?: string; others: { name: string; content: string }[] }> = {};
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const rel = (file as any).webkitRelativePath || file.name;
+      const parts = rel.split('/');
+      const folder = parts.length > 1 ? parts[0] : 'root';
+      map[folder] = map[folder] || { others: [] };
+
+      const lower = file.name.toLowerCase();
+      if (lower === 'skill.md') {
+        map[folder].skillMd = await file.text();
+      } else if (lower.endsWith('.md') || lower.endsWith('.markdown')) {
+        map[folder].others.push({ name: file.name, content: await file.text() });
+      } else if (lower.endsWith('.yaml') || lower.endsWith('.yml')) {
+        map[folder].others.push({ name: file.name, content: await file.text() });
+      }
+    }
+
+    const skills: { name: string; content: string }[] = [];
+    Object.entries(map).forEach(([folder, v]) => {
+      const base = (v.skillMd || '').trim();
+      if (!base) return;
+      const appendix = (v.others || [])
+        .filter(x => x.name.toLowerCase() !== 'skill.md')
+        .map(x => `\n\n---\n\n# ${x.name}\n\n${x.content}`.trim())
+        .join('\n');
+      const merged = `${base}${appendix ? `\n\n${appendix}` : ''}`.trim();
+      skills.push({ name: folder, content: merged });
+    });
+
+    setCustomSkills(skills);
+    setSelectedSkillName(skills.length > 0 ? skills[0].name : '');
+  };
+
+  const handleSkillFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    const file = files[0];
+    const content = await file.text();
+    const name = file.name.toLowerCase().endsWith('.md')
+      ? file.name.replace(/\.md$/i, '')
+      : file.name;
+    setCustomSkills([{ name, content }]);
+    setSelectedSkillName(name);
+  };
+
+  // 保存 LLM 配置
+  const handleSaveConfig = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      await axios.post(`${apiBase}/api/llm/config`, config);
+      setConfigStatus('success');
+      setTimeout(() => setConfigStatus(''), 3000);
+    } catch (err) {
+      setConfigStatus('error');
+    }
+  };
+
+  const handleManualAuthorizeAccess = async () => {
+    if (isDesktopApp()) {
+      setActiveTab('desktop');
+      return;
+    }
+    if (!isValidApiBase(apiBase)) {
+      alert('当前后端地址不可用，请先启动后端或检查端口配置');
+      return;
+    }
+    const base = normalizeApiBase(apiBase);
+    const shouldForce = config.authorized
+      ? window.confirm('检测到你之前已授权过。是否重新授权（会重新打开登录浏览器）？')
+      : false;
+    setAuthLoading(true);
+    try {
+      await axios.post(`${base}/api/auth/start`, shouldForce ? { force: true } : {});
+      setConfig(prev => ({ ...prev, authorized: true }));
+      setAuthModal(false);
+      alert('授权完成：已保存登录态。现在可以访问需要登录的页面。');
+    } catch (err: any) {
+      const msg = err?.response?.data?.detail || err?.message || '授权失败，请重试';
+      if (isNetworkError(err)) {
+        alert(formatBackendStartHelp(base));
+      } else {
+        alert(msg);
+      }
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  // 提交爬取并处理的任务
+  const handleProcessTask = async (e: React.FormEvent) => {
+    e.preventDefault();
+
+    const base = normalizeApiBase(apiBase);
+    if (!isValidApiBase(apiBase)) {
+      setError('当前后端地址不可用，请先启动后端或检查端口配置');
+      return;
+    }
+
+    if (!config.authorized) {
+      if (isDesktopApp()) {
+        setError('桌面版请先到「控制台」完成授权登录（并确保后端为 running），再执行批量任务');
+        setAuthModal(false);
+        setActiveTab('desktop');
+        return;
+      }
+
+      try {
+        const st = await axios.get(`${base}/api/auth/status`);
+        const ok = !!st?.data?.authorized;
+        if (ok) {
+          setConfig(prev => ({ ...prev, authorized: true }));
+        } else {
+          setAuthModal(true);
+          return;
+        }
+      } catch (err: any) {
+        try {
+          const cfg = await axios.get(`${base}/api/llm/config`);
+          const ok = !!cfg?.data?.authorized;
+          if (ok) {
+            setConfig(prev => ({ ...prev, authorized: true }));
+          } else {
+            setAuthModal(true);
+            return;
+          }
+        } catch (err2: any) {
+          if (isNetworkError(err2)) {
+            alert(formatBackendStartHelp(base));
+          } else {
+            const msg = err2?.response?.data?.detail || err2?.message || '无法确认授权状态';
+            setError(msg);
+          }
+          return;
+        }
+      }
+    }
+
+    setLoading(true);
+    setError('');
+    setResult(null);
+    
+    try {
+      // 解析文本框输入的多行数据，严格限制只包含 URL
+      const lines = batchInput.split('\n').map(l => l.trim()).filter(l => l);
+      const urls = lines;
+
+      if (urls.length === 0) {
+        throw new Error("请输入有效的 URL 列表");
+      }
+
+      // 构造请求数据，一并发送所选技能的内容
+      const custom_skills_dict: Record<string, string> = {};
+      customSkills.forEach(s => {
+        custom_skills_dict[s.name] = s.content;
+      });
+      
+      const payload: any = {
+        urls,
+        custom_skills: Object.keys(custom_skills_dict).length > 0 ? custom_skills_dict : undefined,
+        skill_name: selectedSkillName || undefined,
+        drill_config: drillEnabled
+          ? {
+              enabled: true,
+              max_depth: drillDepth,
+            }
+          : { enabled: false },
+      };
+      
+      const res = await axios.post(`${base}/api/task/batch`, payload);
+      setResult(res.data);
+    } catch (err: any) {
+      setError(err.response?.data?.detail || err.message || '处理失败');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleAuth = async () => {
+    try {
+      if (!isValidApiBase(apiBase)) {
+        alert('当前后端地址不可用，请先启动后端或检查端口配置');
+        return;
+      }
+      const base = normalizeApiBase(apiBase);
+      await axios.post(`${base}/api/auth/start`);
+      setConfig(prev => ({ ...prev, authorized: true }));
+      setAuthModal(false);
+    } catch (err: any) {
+      const msg = err?.response?.data?.detail || err?.message || "授权失败，请重试";
+      if (isNetworkError(err)) {
+        alert(formatBackendStartHelp(apiBase));
+      } else {
+        alert(msg);
+      }
+    }
+  };
+
+  const handleCancelAuth = () => {
+    setAuthModal(false);
+    alert("您已拒绝授权。程序需要浏览器授权才能抓取内部页面，请稍后重试。");
+  };
+
+  const handleSelectHistory = async (eventId: number) => {
+    setHistoryLoading(true);
+    try {
+      const res = await axios.get(`${apiBase}/api/history/events/${eventId}`);
+      setHistorySelected(res.data.event);
+      setHistoryItems(res.data.items || []);
+    } catch (err: any) {
+      setError(err.response?.data?.detail || err.message || '加载历史详情失败');
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const handleOpenHistoryPath = async (eventId: number) => {
+    try {
+      await axios.post(`${apiBase}/api/history/open`, { event_id: eventId });
+    } catch (err: any) {
+      setError(err.response?.data?.detail || err.message || '打开路径失败');
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-brand-bg text-brand-text font-sans antialiased selection:bg-brand-primary/30">
+      <header className="sticky top-0 z-50 bg-white/80 backdrop-blur-md shadow-sm border-b border-white/20">
+        <div className="max-w-5xl mx-auto px-6 py-4 flex items-center justify-between">
+          <h1 className="text-2xl font-bold font-serif text-brand-text flex items-center gap-3">
+            <div className="bg-brand-primary p-2 rounded-xl text-white shadow-soft">
+              <TerminalSquare className="w-5 h-5" />
+            </div>
+            AI-DCP Intelligence
+          </h1>
+          <div className="flex items-center gap-4">
+            <Button
+              onClick={handleManualAuthorizeAccess}
+              variant="cta"
+              isLoading={authLoading}
+              className="flex items-center gap-2"
+              title={isDesktopApp() ? '桌面版请在控制台完成授权' : '手动打开授权登录浏览器，获取 Cookie/Storage'}
+            >
+              <Globe className="w-4 h-4" />
+              手动授权访问
+            </Button>
+            {isDesktopApp() && (
+              <Button
+                onClick={handleBackendToggle}
+                variant={backendRunning ? 'secondary' : 'primary'}
+                isLoading={backendLoading}
+                className="flex items-center gap-2"
+              >
+                {backendLoading ? (
+                  <Activity className="w-4 h-4 animate-spin" />
+                ) : backendRunning ? (
+                  <Power className="w-4 h-4" />
+                ) : (
+                  <Power className="w-4 h-4" />
+                )}
+                {backendRunning ? '停止后端' : '启动后端'}
+              </Button>
+            )}
+            <nav className="flex gap-2 bg-gray-100/50 p-1 rounded-xl border border-gray-200/50">
+              <button
+                onClick={() => setActiveTab('process')}
+                className={`px-5 py-2 rounded-lg text-sm font-medium transition-all duration-300 ${activeTab === 'process' ? 'bg-white shadow-sm text-brand-text' : 'text-gray-500 hover:text-brand-text hover:bg-white/50'}`}
+                aria-label="切换到任务处理"
+              >
+                任务处理
+              </button>
+              <button
+                onClick={() => setActiveTab('history')}
+                className={`px-5 py-2 rounded-lg text-sm font-medium transition-all duration-300 ${activeTab === 'history' ? 'bg-white shadow-sm text-brand-text' : 'text-gray-500 hover:text-brand-text hover:bg-white/50'}`}
+                aria-label="切换到历史记录"
+              >
+                历史记录
+              </button>
+              {isDesktopApp() && (
+                <button
+                  onClick={() => setActiveTab('desktop')}
+                  className={`px-5 py-2 rounded-lg text-sm font-medium transition-all duration-300 ${activeTab === 'desktop' ? 'bg-white shadow-sm text-brand-text' : 'text-gray-500 hover:text-brand-text hover:bg-white/50'}`}
+                  aria-label="切换到桌面控制台"
+                >
+                  控制台
+                </button>
+              )}
+              <button
+                onClick={() => setActiveTab('config')}
+                className={`px-5 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-all duration-300 ${activeTab === 'config' ? 'bg-white shadow-sm text-brand-text' : 'text-gray-500 hover:text-brand-text hover:bg-white/50'}`}
+                aria-label="切换到LLM配置"
+              >
+                <Settings className="w-4 h-4" /> LLM配置
+              </button>
+            </nav>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-5xl mx-auto px-6 py-10">
+        {activeTab === 'config' && (
+          <Card className="max-w-2xl mx-auto transform transition-all duration-500 animate-in fade-in slide-in-from-bottom-4">
+            <h2 className="text-2xl font-serif font-bold mb-8 flex items-center gap-2">大语言模型 (LLM) 配置</h2>
+            <form onSubmit={handleSaveConfig} className="space-y-6">
+              {!isDesktopApp() && (
+                <Input
+                  label="后端地址 (API_BASE)"
+                  type="url"
+                  value={apiBase}
+                  onChange={(e: any) => setApiBase(e.target.value)}
+                  required
+                  helperText="示例: http://127.0.0.1:8000 （不要填 https://oa.ksyun.com）"
+                />
+              )}
+              <Input
+                label="API Token"
+                type="password"
+                value={config.api_token}
+                onChange={(e: any) => setConfig({ ...config, api_token: e.target.value })}
+                required
+                helperText="请安全输入您的 Token"
+              />
+              <Input
+                label="Base URL"
+                type="url"
+                value={config.base_url}
+                onChange={(e: any) => setConfig({ ...config, base_url: e.target.value })}
+                required
+              />
+              <Input
+                label="模型名称"
+                type="text"
+                value={config.model}
+                onChange={(e: any) => setConfig({ ...config, model: e.target.value })}
+                required
+              />
+              <div className="grid grid-cols-2 gap-6">
+                <Input
+                  label="超时时间 (秒)"
+                  type="number"
+                  value={config.timeout}
+                  onChange={(e: any) => setConfig({ ...config, timeout: Number(e.target.value) })}
+                />
+                <Input
+                  label="重试次数"
+                  type="number"
+                  value={config.retry}
+                  onChange={(e: any) => setConfig({ ...config, retry: Number(e.target.value) })}
+                />
+              </div>
+              <div className="pt-4 flex items-center gap-4">
+                <Button type="submit" variant="primary">
+                  保存配置
+                </Button>
+                {configStatus === 'success' && <span className="text-brand-secondary flex items-center gap-1 font-medium animate-in fade-in slide-in-from-left-2"><CheckCircle className="w-4 h-4"/> 已保存</span>}
+                {configStatus === 'error' && <span className="text-red-500 flex items-center gap-1 font-medium animate-in fade-in slide-in-from-left-2"><AlertCircle className="w-4 h-4"/> 保存失败</span>}
+              </div>
+            </form>
+          </Card>
+        )}
+
+        {activeTab === 'process' && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 transform transition-all duration-500 animate-in fade-in slide-in-from-bottom-4">
+            <Card className="lg:col-span-5 h-fit sticky top-28">
+              <h2 className="text-2xl font-serif font-bold mb-8 flex items-center gap-2">
+                <List className="w-6 h-6 text-brand-primary" /> 批量任务处理
+              </h2>
+              <div className="mb-4 text-xs text-gray-500 break-all">后端地址: {normalizeApiBase(apiBase)}</div>
+              <form onSubmit={handleProcessTask} className="space-y-6">
+                <Input
+                  isTextarea
+                  label="任务列表 (批量)"
+                  rows={8}
+                  value={batchInput}
+                  onChange={(e: any) => setBatchInput(e.target.value)}
+                  className="font-mono text-sm whitespace-pre resize-none"
+                  placeholder={`每行输入一个目标 URL，不包含其他任何元数据信息：\nhttps://oa.ksyun.com/workflow/req?requestid=1\nhttps://oa.ksyun.com/workflow/req?requestid=2`}
+                  required
+                />
+                
+                <div className="space-y-1.5">
+                  <label className="block text-sm font-semibold text-[#2D3436]">
+                    技能文件 / 文件夹
+                  </label>
+                  <div className="grid grid-cols-2 gap-3">
+                    <label className="flex items-center justify-center w-full px-4 py-3 bg-gray-50/50 border border-gray-200 border-dashed rounded-xl cursor-pointer hover:bg-brand-primary/5 hover:border-brand-primary/50 transition-all duration-300 focus-within:ring-2 focus-within:ring-brand-primary">
+                      <FolderOpen className="w-5 h-5 mr-2 text-gray-500" />
+                      <span className="text-sm font-medium text-gray-600">
+                        选择技能文件夹
+                      </span>
+                      <input
+                        type="file"
+                        // @ts-ignore: webkitdirectory is a non-standard attribute but widely supported
+                        webkitdirectory=""
+                        directory=""
+                        className="sr-only"
+                        onChange={handleFolderSelect}
+                      />
+                    </label>
+                    <label className="flex items-center justify-center w-full px-4 py-3 bg-gray-50/50 border border-gray-200 border-dashed rounded-xl cursor-pointer hover:bg-brand-primary/5 hover:border-brand-primary/50 transition-all duration-300 focus-within:ring-2 focus-within:ring-brand-primary">
+                      <FolderOpen className="w-5 h-5 mr-2 text-gray-500" />
+                      <span className="text-sm font-medium text-gray-600">
+                        选择 skill.md
+                      </span>
+                      <input
+                        type="file"
+                        accept=".md,.markdown,.yaml,.yml"
+                        className="sr-only"
+                        onChange={handleSkillFileSelect}
+                      />
+                    </label>
+                  </div>
+                  {customSkills.length > 0 && (
+                    <p className="mt-1 text-xs text-brand-secondary font-medium animate-in fade-in">
+                      已加载 {customSkills.length} 个技能。建议选择一个技能用于本次批量任务
+                    </p>
+                  )}
+                  {customSkills.length > 1 && (
+                    <div className="mt-3">
+                      <label className="block text-sm font-semibold text-[#2D3436] mb-1">本次使用的技能</label>
+                      <select
+                        value={selectedSkillName}
+                        onChange={(e) => setSelectedSkillName(e.target.value)}
+                        className="w-full px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50/50 text-[#2D3436] focus:bg-white focus:border-[#E8B4B8] focus:ring-4 focus:ring-[#E8B4B8]/20 outline-none"
+                      >
+                        <option value="" disabled>请选择一个技能</option>
+                        {customSkills.map(s => (
+                          <option key={s.name} value={s.name}>{s.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+                </div>
+
+                <div className="space-y-3">
+                  <label className="flex items-center gap-3 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={drillEnabled}
+                      onChange={(e) => setDrillEnabled(e.target.checked)}
+                      className="h-4 w-4 rounded border-gray-300 text-brand-primary focus:ring-brand-cta"
+                    />
+                    <span className="text-sm font-semibold text-brand-text">启用网页下钻</span>
+                  </label>
+                  {drillEnabled && (
+                    <div className="p-4 rounded-2xl border border-brand-primary/20 bg-white/60 shadow-soft space-y-4 animate-in fade-in">
+                      <div className="text-xs text-gray-600 leading-relaxed">
+                        下钻会自动跟随页面里的链接逐层打开并抓取内容，用于补全信息。你只需要填“下钻层数”，其它参数系统会自动处理。
+                      </div>
+                      <Input
+                        label="下钻层数"
+                        type="number"
+                        min={1}
+                        value={drillDepth}
+                        onChange={(e: any) => setDrillDepth(Number(e.target.value))}
+                        helperText="建议 3（更深会更慢）；你填多少就按多少执行"
+                      />
+                    </div>
+                  )}
+                </div>
+
+                <div className="pt-6 border-t border-gray-100">
+                  <Button
+                    type="submit"
+                    variant="cta"
+                    isLoading={loading}
+                    className="w-full text-base py-3"
+                  >
+                    一键批量处理
+                  </Button>
+                </div>
+              </form>
+            </Card>
+
+            <Card className="lg:col-span-7 min-h-[600px] flex flex-col bg-white/50">
+              <h2 className="text-2xl font-serif font-bold mb-8">批处理状态与报告</h2>
+              
+              {error && (
+                <div className="bg-red-50 text-red-600 p-4 rounded-xl mb-6 flex items-start gap-3 border border-red-100 animate-in slide-in-from-top-2">
+                  <AlertCircle className="w-5 h-5 shrink-0 mt-0.5" />
+                  <p className="text-sm font-medium leading-relaxed">{error}</p>
+                </div>
+              )}
+
+              {loading && (
+                <div className="flex-1 flex items-center justify-center text-gray-400 animate-in fade-in duration-500">
+                  <div className="flex flex-col items-center gap-4">
+                    <div className="relative">
+                      <div className="absolute inset-0 bg-brand-primary/20 rounded-full blur-xl animate-pulse"></div>
+                      <Globe className="w-12 h-12 animate-spin text-brand-primary relative z-10" />
+                    </div>
+                    <p className="font-medium tracking-wide">引擎正在后台逐行提取并思考中...</p>
+                  </div>
+                </div>
+              )}
+
+              {!loading && !result && !error && (
+                <div className="flex-1 flex flex-col items-center justify-center text-gray-400/80 space-y-4">
+                  <div className="p-4 bg-gray-50 rounded-full">
+                    <List className="w-8 h-8 text-gray-300" />
+                  </div>
+                  <p className="font-medium">在此区域显示任务提交状态与 Excel 报告路径</p>
+                </div>
+              )}
+
+              {result && !loading && (
+                <div className="flex-1 flex flex-col animate-in fade-in slide-in-from-bottom-4">
+                  <div className="bg-brand-secondary/10 text-[#2D3436] p-5 rounded-xl mb-6 flex items-start gap-3 border border-brand-secondary/30 shadow-sm">
+                    <CheckCircle className="w-5 h-5 shrink-0 mt-0.5 text-brand-secondary" />
+                    <p className="text-sm font-medium leading-relaxed">{result.message}</p>
+                  </div>
+                  <div className="bg-white p-6 rounded-xl flex-1 border border-gray-100 shadow-soft">
+                    <p className="font-bold font-serif text-lg mb-3">生成报告路径:</p>
+                    <code className="block bg-gray-50 border border-gray-200 px-4 py-3 rounded-lg text-sm text-gray-600 font-mono break-all select-all shadow-inner">
+                      {result.report_path}
+                    </code>
+                    <div className="mt-6 p-4 bg-blue-50/50 rounded-lg border border-blue-100/50">
+                      <p className="text-gray-500 text-sm leading-relaxed">
+                        注：此操作将在后台异步执行。您可以打开上述 Excel 文件实时查看写入进度。断点续跑已自动开启。
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </Card>
+          </div>
+        )}
+
+        {activeTab === 'desktop' && isDesktopApp() && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 transform transition-all duration-500 animate-in fade-in slide-in-from-bottom-4">
+            <Card className="lg:col-span-5 h-fit sticky top-28">
+              <h2 className="text-2xl font-serif font-bold mb-8">后端控制面板</h2>
+              <div className="space-y-4">
+                <div className="p-4 rounded-2xl border border-gray-100 bg-white">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-sm font-semibold text-brand-text">服务状态</div>
+                    <div className="text-xs text-gray-600">{backendStatus?.state || 'unknown'}</div>
+                  </div>
+                  <div className="mt-2 text-xs text-gray-500 break-all">API_BASE: {backendStatus?.apiBase || API_BASE}</div>
+                  <div className="mt-1 text-xs text-gray-500">PID: {backendStatus?.pid ?? '-'}</div>
+                  {backendStatus?.lastError && (
+                    <div className="mt-2 text-xs text-red-600 break-all">错误: {backendStatus.lastError}</div>
+                  )}
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <Button type="button" variant="primary" onClick={handleBackendToggle} isLoading={backendLoading}>
+                    {backendRunning ? '停止' : '启动'}
+                  </Button>
+                  <Button type="button" variant="secondary" onClick={handleBackendRestart} isLoading={backendLoading}>
+                    重启
+                  </Button>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <Button type="button" variant="cta" onClick={() => handleBackendAuth(false)} isLoading={backendLoading}>
+                    授权登录
+                  </Button>
+                  <Button type="button" variant="ghost" onClick={() => handleBackendAuth(true)} isLoading={backendLoading}>
+                    重新授权
+                  </Button>
+                </div>
+                <Button type="button" variant="ghost" onClick={handleOpenWebView}>
+                  内置浏览器（仅浏览）
+                </Button>
+                <div className="p-4 rounded-2xl border border-gray-100 bg-white">
+                  <div className="text-sm font-semibold text-brand-text">资源占用</div>
+                  <div className="mt-2 text-xs text-gray-600">CPU: {metrics?.cpu == null ? '-' : `${metrics.cpu.toFixed(1)}%`}</div>
+                  <div className="mt-1 text-xs text-gray-600">内存: {metrics?.memoryMB == null ? '-' : `${metrics.memoryMB.toFixed(1)} MB`}</div>
+                </div>
+              </div>
+            </Card>
+
+            <Card className="lg:col-span-7 min-h-[600px] flex flex-col bg-white/50">
+              <h2 className="text-2xl font-serif font-bold mb-8">实时日志</h2>
+              <div className="flex gap-3 items-end mb-4">
+                <div className="w-40">
+                  <label className="block text-sm font-semibold text-[#2D3436] mb-1">级别</label>
+                  <select
+                    value={logLevel}
+                    onChange={(e) => setLogLevel(e.target.value as any)}
+                    className="w-full px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50/50 text-[#2D3436] focus:bg-white focus:border-[#E8B4B8] focus:ring-4 focus:ring-[#E8B4B8]/20 outline-none"
+                  >
+                    <option value="all">全部</option>
+                    <option value="stdout">stdout</option>
+                    <option value="stderr">stderr</option>
+                  </select>
+                </div>
+                <div className="flex-1">
+                  <Input
+                    label="关键词"
+                    type="text"
+                    value={logKeyword}
+                    onChange={(e: any) => setLogKeyword(e.target.value)}
+                    placeholder="输入关键词过滤日志"
+                  />
+                </div>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={() => setLogs([])}
+                >
+                  清空
+                </Button>
+              </div>
+              <div className="flex-1 overflow-auto bg-white border border-gray-100 rounded-xl p-3 font-mono text-xs text-gray-700">
+                {(logs || [])
+                  .filter((l) => (logLevel === 'all' ? true : l.source === logLevel))
+                  .filter((l) => (logKeyword ? String(l.line).toLowerCase().includes(logKeyword.toLowerCase()) : true))
+                  .slice(-1500)
+                  .map((l, idx) => (
+                    <div key={idx} className="whitespace-pre-wrap break-words">
+                      <span className="text-gray-400">{new Date(l.ts).toLocaleTimeString()} </span>
+                      <span className={l.source === 'stderr' ? 'text-red-600' : 'text-gray-700'}>
+                        [{l.source}] {l.line}
+                      </span>
+                    </div>
+                  ))}
+              </div>
+            </Card>
+          </div>
+        )}
+
+        {activeTab === 'history' && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 transform transition-all duration-500 animate-in fade-in slide-in-from-bottom-4">
+            <Card className="lg:col-span-5 h-fit sticky top-28">
+              <h2 className="text-2xl font-serif font-bold mb-8">历史记录</h2>
+              <div className="space-y-6">
+                <Input
+                  label="搜索"
+                  type="text"
+                  value={historyQuery}
+                  onChange={(e: any) => setHistoryQuery(e.target.value)}
+                  placeholder="按标题或 URL 搜索"
+                />
+                <div className="space-y-3">
+                  {historyLoading && (
+                    <p className="text-sm text-gray-500">正在加载历史记录...</p>
+                  )}
+                  {!historyLoading && historyEvents.length === 0 && (
+                    <p className="text-sm text-gray-500">暂无历史记录</p>
+                  )}
+                  {!historyLoading && historyEvents.map((ev) => (
+                    (() => {
+                      const ts = ev.ts ? new Date(ev.ts * 1000).toLocaleString() : '';
+                      const status = ev.status || 'queued';
+                      const statusLabel = status === 'running'
+                        ? '运行中'
+                        : status === 'completed'
+                          ? '已完成'
+                          : status === 'failed'
+                            ? '失败'
+                            : '排队中';
+                      const statusClass = status === 'running'
+                        ? 'bg-brand-cta/15 text-brand-text border border-brand-cta/30'
+                        : status === 'completed'
+                          ? 'bg-brand-secondary/15 text-brand-text border border-brand-secondary/30'
+                          : status === 'failed'
+                            ? 'bg-red-50 text-red-700 border border-red-200'
+                            : 'bg-gray-100 text-gray-600 border border-gray-200';
+                      const showProgress = ev.kind === 'batch' && typeof ev.total === 'number' && ev.total > 0;
+                      const progressText = showProgress ? `${ev.processed || 0}/${ev.total || 0}` : '';
+                      return (
+                    <button
+                      key={ev.id}
+                      type="button"
+                      onClick={() => handleSelectHistory(ev.id)}
+                      className={`w-full text-left p-4 rounded-xl border transition-all duration-300 ${historySelected?.id === ev.id ? 'border-brand-primary bg-brand-primary/5' : 'border-gray-100 bg-white hover:border-brand-primary/40 hover:bg-brand-primary/5'}`}
+                      aria-label={`查看历史记录: ${ev.title}`}
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="text-sm font-semibold text-brand-text truncate">{ev.title}</div>
+                        <div className="text-xs text-gray-500 shrink-0">#{ev.id}</div>
+                      </div>
+                      <div className="mt-1 text-xs text-gray-500 break-all">{ev.url}</div>
+                      <div className="mt-2 flex items-center gap-2 flex-wrap">
+                        <span className={`text-xs px-2 py-1 rounded-full ${statusClass}`}>{statusLabel}</span>
+                        {progressText && <span className="text-xs px-2 py-1 rounded-full bg-gray-50 text-gray-600 border border-gray-200">进度 {progressText}</span>}
+                        <span className="text-xs px-2 py-1 rounded-full bg-gray-100 text-gray-600">{ev.kind}</span>
+                        {ev.path && <span className="text-xs px-2 py-1 rounded-full bg-brand-secondary/10 text-brand-text">可打开</span>}
+                      </div>
+                      {ts && <div className="mt-2 text-xs text-gray-400">创建时间 {ts}</div>}
+                    </button>
+                      );
+                    })()
+                  ))}
+                </div>
+              </div>
+            </Card>
+
+            <Card className="lg:col-span-7 min-h-[600px] flex flex-col bg-white/50">
+              <h2 className="text-2xl font-serif font-bold mb-8">详情</h2>
+              {!historySelected && (
+                <div className="flex-1 flex flex-col items-center justify-center text-gray-400/80 space-y-4">
+                  <div className="p-4 bg-gray-50 rounded-full">
+                    <List className="w-8 h-8 text-gray-300" />
+                  </div>
+                  <p className="font-medium">从左侧选择一条历史记录查看详情</p>
+                </div>
+              )}
+              {historySelected && (
+                <div className="flex-1 flex flex-col gap-6 animate-in fade-in">
+                  <div className="bg-white p-5 rounded-xl border border-gray-100 shadow-soft">
+                    <div className="flex items-start justify-between gap-4">
+                      <div>
+                        <p className="text-lg font-bold font-serif">{historySelected.title}</p>
+                        <p className="text-xs text-gray-500 break-all mt-1">{historySelected.url}</p>
+                      </div>
+                      {historySelected.path && (
+                        <Button type="button" variant="secondary" onClick={() => handleOpenHistoryPath(historySelected.id)}>
+                          打开所在位置
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="bg-white p-5 rounded-xl border border-gray-100 shadow-soft flex-1 overflow-auto">
+                    <p className="text-sm font-semibold text-gray-700 mb-3">明细</p>
+                    <div className="space-y-3">
+                      {historyItems.length === 0 && (
+                        <p className="text-sm text-gray-500">该记录暂无明细</p>
+                      )}
+                      {historyItems.map((it) => (
+                        <div key={it.id} className="p-4 rounded-xl border border-gray-100 bg-gray-50/30">
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="text-sm font-medium text-brand-text break-all">{it.url}</div>
+                            <span className="text-xs px-2 py-1 rounded-full bg-gray-100 text-gray-600">{it.status}</span>
+                          </div>
+                          {it.skill && (
+                            <div className="mt-2 text-xs text-gray-600">技能: {it.skill}</div>
+                          )}
+                          {it.evidence && (
+                            <div className="mt-2 text-xs text-gray-600">证据: {it.evidence}</div>
+                          )}
+                          {it.meta?.drill?.enabled && (
+                            <div className="mt-2 text-xs text-gray-600">
+                              下钻: visited={it.meta.drill.visited}, included={it.meta.drill.included}, failed={it.meta.drill.failed}
+                            </div>
+                          )}
+                          {it.result && (
+                            <div className="mt-2 text-xs text-gray-600">结果: {it.result}</div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </Card>
+          </div>
+        )}
+
+        {/* 首次授权模态窗 */}
+        {authModal && (
+          <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-50 animate-in fade-in duration-300 p-4">
+            <div className="bg-white p-8 rounded-3xl max-w-md w-full shadow-2xl border border-white/20 transform animate-in zoom-in-95 duration-300">
+              <h3 className="text-2xl font-serif font-bold mb-4 flex items-center gap-2 text-brand-text">
+                <span className="bg-brand-cta/10 p-2 rounded-xl"><Globe className="w-6 h-6 text-brand-cta" /></span>
+                首次运行授权请求
+              </h3>
+              <div className="text-[#2D3436]/80 text-sm mb-8 space-y-4 leading-relaxed">
+                <p>
+                  您是首次运行本系统。系统需要您手动登录一次内部平台，以获取并持久化保存您的访问凭证（Cookie/Storage）。
+                </p>
+                <div className="bg-brand-bg p-4 rounded-xl border border-brand-primary/20">
+                  <p className="font-medium text-brand-text">
+                    操作指南：
+                  </p>
+                  <ul className="list-disc list-inside mt-2 space-y-1 text-xs">
+                    <li>点击下方同意后，系统将弹出一个可视化的浏览器窗口。</li>
+                    <li>请在弹出的窗口中完成登录操作。</li>
+                    <li><strong>登录成功后，请手动关闭该浏览器窗口。</strong></li>
+                  </ul>
+                </div>
+                <p className="text-xs text-gray-500">
+                  系统会将凭证加密保存在本地，后续将自动静默运行，不再弹窗。
+                </p>
+              </div>
+              <div className="flex justify-end gap-3 pt-2">
+                <Button onClick={handleCancelAuth} variant="ghost" className="px-5">
+                  拒绝并退出
+                </Button>
+                {isDesktopApp() ? (
+                  <Button
+                    onClick={() => {
+                      setAuthModal(false);
+                      setActiveTab('desktop');
+                    }}
+                    variant="cta"
+                    className="px-6 shadow-md hover:shadow-lg"
+                  >
+                    去控制台授权
+                  </Button>
+                ) : (
+                  <Button onClick={handleAuth} variant="cta" className="px-6 shadow-md hover:shadow-lg">
+                    同意并开启浏览器
+                  </Button>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
+
+export default App;

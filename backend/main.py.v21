@@ -1,0 +1,329 @@
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+from typing import List, Optional, Dict
+from crawler import WebCrawler
+from config_manager import ConfigManager
+from secret_store import SecretStore
+from llm_processor_v2 import LLMProcessor
+from plugin_manager import PluginManager
+from batch_processor import BatchProcessor
+from logger_setup import global_logger as logger
+import os
+import time
+import asyncio
+import shutil
+from cryptography.fernet import Fernet
+from fastapi.middleware.cors import CORSMiddleware
+from urllib.parse import urlparse
+from history_store import HistoryStore
+from drill_store import DrillStore
+from path_opener import open_in_file_manager, PathOpenError
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
+
+app = FastAPI(title="AI-DCP Backend")
+
+# 允许跨域请求
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 基础目录及配置管理实例
+BASE_DIR = os.environ.get("AI_DCP_BASE_DIR") or os.path.dirname(__file__)
+USER_DATA_DIR = os.environ.get("AI_DCP_USER_DATA_DIR") or os.path.join(BASE_DIR, "data")
+
+CONFIG_DIR = os.path.join(BASE_DIR, "config")
+PLUGIN_DIR = os.path.join(BASE_DIR, "plugins")
+DATA_DIR = os.path.join(USER_DATA_DIR, "data")
+OUTPUT_DIR = os.path.join(USER_DATA_DIR, "output")
+LOG_DIR = os.path.join(USER_DATA_DIR, "logs")
+
+os.makedirs(os.path.join(CONFIG_DIR, "skill"), exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+_BG_WORKERS = int(os.environ.get("AI_DCP_BG_WORKERS") or "2")
+_BG_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, _BG_WORKERS))
+
+config_manager = ConfigManager(CONFIG_DIR)
+secret_store = SecretStore(
+    key_path=os.path.join(USER_DATA_DIR, "secret.key"),
+    store_path=os.path.join(USER_DATA_DIR, "llm_config.enc"),
+)
+
+
+def _maybe_migrate_legacy_llm_config():
+    legacy_key_path = os.path.join(BASE_DIR, "secret.key")
+    legacy_store_path = os.path.join(BASE_DIR, "llm_config.enc")
+    target_key_path = secret_store.key_path
+    target_store_path = secret_store.store_path
+
+    if not os.path.exists(legacy_store_path) or not os.path.exists(legacy_key_path):
+        return
+
+    loaded = secret_store.load_config()
+    if loaded:
+        return
+
+    try:
+        with open(legacy_store_path, "rb") as f:
+            legacy_store_bytes = f.read()
+    except Exception:
+        return
+
+    try:
+        secret_store.cipher.decrypt(legacy_store_bytes)
+        os.makedirs(os.path.dirname(target_store_path), exist_ok=True)
+        if os.path.exists(target_store_path):
+            os.replace(target_store_path, f"{target_store_path}.bak.{int(time.time())}")
+        with open(target_store_path, "wb") as f:
+            f.write(legacy_store_bytes)
+        return
+    except Exception:
+        pass
+
+    try:
+        with open(legacy_key_path, "rb") as f:
+            legacy_key_bytes = f.read()
+        legacy_cipher = Fernet(legacy_key_bytes)
+        legacy_cipher.decrypt(legacy_store_bytes)
+
+        os.makedirs(os.path.dirname(target_key_path), exist_ok=True)
+        if os.path.exists(target_key_path):
+            os.replace(target_key_path, f"{target_key_path}.bak.{int(time.time())}")
+        with open(target_key_path, "wb") as f:
+            f.write(legacy_key_bytes)
+
+        secret_store.key = legacy_key_bytes
+        secret_store.cipher = legacy_cipher
+
+        os.makedirs(os.path.dirname(target_store_path), exist_ok=True)
+        if os.path.exists(target_store_path):
+            os.replace(target_store_path, f"{target_store_path}.bak.{int(time.time())}")
+        with open(target_store_path, "wb") as f:
+            f.write(legacy_store_bytes)
+    except Exception:
+        return
+
+
+_maybe_migrate_legacy_llm_config()
+
+
+def _count_rows(db_path: str, table: str) -> Optional[int]:
+    if not os.path.exists(db_path):
+        return None
+    try:
+        con = sqlite3.connect(db_path)
+        cur = con.cursor()
+        cur.execute(f"select count(*) from {table}")
+        n = cur.fetchone()[0]
+        con.close()
+        return int(n)
+    except Exception:
+        return None
+
+
+def _maybe_migrate_legacy_history_and_drill_db():
+    legacy_history = os.path.join(USER_DATA_DIR, "history.db")
+    legacy_drill = os.path.join(USER_DATA_DIR, "drill.db")
+    target_history = os.path.join(DATA_DIR, "history.db")
+    target_drill = os.path.join(DATA_DIR, "drill.db")
+
+    def copy_if_needed(legacy_path: str, target_path: str, table: str):
+        if not os.path.exists(legacy_path):
+            return
+
+        legacy_count = _count_rows(legacy_path, table)
+        if legacy_count is None or legacy_count <= 0:
+            return
+
+        target_count = _count_rows(target_path, table)
+        if target_count is not None and target_count >= legacy_count:
+            return
+
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        if os.path.exists(target_path):
+            os.replace(target_path, f"{target_path}.bak.{int(time.time())}")
+        os.replace(legacy_path, target_path)
+
+    copy_if_needed(legacy_history, target_history, "history_events")
+    copy_if_needed(legacy_drill, target_drill, "drill_sessions")
+
+
+_maybe_migrate_legacy_history_and_drill_db()
+plugin_manager = PluginManager(PLUGIN_DIR)
+
+history_store = HistoryStore(os.path.join(DATA_DIR, "history.db"))
+drill_store = DrillStore(os.path.join(DATA_DIR, "drill.db"))
+
+
+def _run_coro_in_new_loop(coro_fn, *args, **kwargs):
+    import asyncio
+    asyncio.run(coro_fn(*args, **kwargs))
+
+
+def _submit_background(coro_fn, *args, **kwargs) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        loop.run_in_executor(_BG_EXECUTOR, _run_coro_in_new_loop, coro_fn, *args, **kwargs)
+        return
+
+    _BG_EXECUTOR.submit(_run_coro_in_new_loop, coro_fn, *args, **kwargs)
+
+
+# 初始化一些示例配置
+agent_md_path = os.path.join(CONFIG_DIR, "Agent.md")
+if not os.path.exists(agent_md_path):
+    with open(agent_md_path, "w", encoding="utf-8") as f:
+        f.write("# Agent Role\n你是一个强大的 AI 知识提取与分析助手。请根据抓取的内容进行总结分析。")
+
+
+class LLMConfig(BaseModel):
+    api_token: str
+    base_url: str
+    model: str
+    timeout: int = 60
+    retry: int = 3
+
+
+class CrawlRequest(BaseModel):
+    url: str
+    max_depth: int = 3
+    headless: bool = True
+    skill_name: Optional[str] = "summary"
+    custom_skill_content: Optional[str] = None
+
+
+class BatchRequest(BaseModel):
+    urls: List[str]
+    custom_skills: Optional[Dict[str, str]] = None
+    drill_config: Optional[Dict[str, object]] = None
+    skill_name: Optional[str] = None
+
+
+class JsonInputItem(BaseModel):
+    url: Optional[str] = None
+    payload: object
+    meta: Optional[Dict[str, object]] = None
+
+
+class BatchIngestRequest(BaseModel):
+    urls: Optional[List[str]] = None
+    json_inputs: Optional[List[JsonInputItem]] = None
+    custom_skills: Optional[Dict[str, str]] = None
+    drill_config: Optional[Dict[str, object]] = None
+    skill_name: Optional[str] = None
+    title: Optional[str] = None
+
+
+class HistoryOpenRequest(BaseModel):
+    event_id: int
+
+
+class DrillStartRequest(BaseModel):
+    url: str
+    max_depth: int = 5
+
+
+class DrillNavigateRequest(BaseModel):
+    session_id: str
+    url: str
+
+
+class DrillBackRequest(BaseModel):
+    session_id: str
+
+
+class AuthStartRequest(BaseModel):
+    force: bool = False
+
+
+def _looks_like_login_page(title: str, content: str, final_url: str) -> bool:
+    t = (title or "").lower()
+    u = (final_url or "").lower()
+    c = (content or "").lower()
+    if any(x in u for x in ["login", "sso", "cas", "passport"]):
+        return True
+    if any(x in t for x in ["登录", "login", "sign in", "统一身份", "单点"]):
+        return True
+    if any(x in c for x in ["用户名", "密码", "验证码", "扫码登录", "单点登录", "统一身份认证", "login"]):
+        return True
+    return False
+
+
+@app.get("/")
+def read_root():
+    return {"status": "ok", "message": "AI-DCP Backend is running!"}
+
+
+@app.post("/api/task/process")
+async def process_task(req: CrawlRequest):
+    crawler = WebCrawler(
+        start_url=req.url,
+        max_depth=req.max_depth,
+        headless=req.headless
+    )
+    try:
+        results = await crawler.run()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"网页抓取失败: {str(e)}")
+
+    if not results:
+        raise HTTPException(status_code=404, detail="未抓取到有效内容")
+
+    combined_content = "\n\n".join([item["content"] for item in results])
+
+    try:
+        skill_name = req.skill_name
+        if (not (req.custom_skill_content or "").strip()) and (not skill_name or skill_name == "summary"):
+            matched, _candidates = config_manager.match_skill(req.url, custom_skills=None)
+            if matched:
+                skill_name = matched
+        plugin_context = {"content": combined_content, "url": req.url}
+        processed_context = plugin_manager.execute_plugins(plugin_context)
+        final_prompt = config_manager.build_final_prompt(
+            skill_name,
+            processed_context.get("content", combined_content),
+            req.custom_skill_content
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=400, detail=f"配置读取失败: {str(e)}")
+
+    llm_config = secret_store.load_config()
+    if not llm_config:
+        raise HTTPException(status_code=400, detail="LLM 配置未初始化，请先在设置中配置 API")
+
+    llm_processor = LLMProcessor(**llm_config)
+
+    try:
+        llm_result = llm_processor.generate(final_prompt)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM 推理失败: {str(e)}")
+
+    evidence = ""
+    result = llm_result
+
+    return {
+        "status": "success",
+        "crawled_pages": len(results),
+        "llm_result": llm_result,
+        "evidence": evidence,
+        "result": result,
+        "raw": llm_result,
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+

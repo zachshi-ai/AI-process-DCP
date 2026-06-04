@@ -1,0 +1,1703 @@
+import React, { useState, useEffect } from 'react';
+import axios from 'axios';
+import { Settings, Globe, CheckCircle, AlertCircle, FolderOpen, List, TerminalSquare, Power, Activity } from 'lucide-react';
+import { Button } from './components/ui/Button';
+import { Card } from './components/ui/Card';
+import { Input } from './components/ui/Input';
+import { PrettyJsonViewer } from './components/PrettyJsonViewer';
+import { PreApprovalDemoPage } from './components/PreApprovalDemoPage';
+import { ABReviewPage } from './components/ABReviewPage';
+import { MbBatchAnalysisPage } from './components/MbBatchAnalysisPage';
+import { getDesktopApi, isDesktopApp } from './desktop';
+
+const API_BASE =
+  (window as any).__AI_DCP_API_BASE ||
+  (import.meta as any).env?.VITE_API_BASE ||
+  'http://localhost:8000';
+
+const API_BASE_FROM_ENV = Boolean((window as any).__AI_DCP_API_BASE || (import.meta as any).env?.VITE_API_BASE);
+
+const normalizeApiBase = (v: string) => {
+  const raw = (v || '').trim();
+  if (!raw) return '';
+  try {
+    const u = new URL(raw);
+    return `${u.protocol}//${u.hostname}${u.port ? `:${u.port}` : ''}`;
+  } catch (_) {
+    return raw.replace(/\/+$/, '');
+  }
+};
+const WEB_API_BASE_STORAGE_KEY = 'AI_DCP_API_BASE';
+const isProbablyElectron = () => {
+  try {
+    const ua = String(navigator.userAgent || '');
+    return ua.toLowerCase().includes('electron');
+  } catch (_) {
+    return false;
+  }
+};
+
+const isValidApiBase = (v: string) => {
+  try {
+    const u = new URL(normalizeApiBase(v));
+    if (!u.protocol || (u.protocol !== 'http:' && u.protocol !== 'https:')) return false;
+    if (!u.port) return true;
+    const port = Number(u.port);
+    if (!Number.isFinite(port) || port <= 0) return false;
+    return true;
+  } catch (_) {
+    return false;
+  }
+};
+
+const formatBackendStartHelp = (base: string) => {
+  const clean = normalizeApiBase(base) || 'http://127.0.0.1:8000';
+  return [
+    '后端连接失败（Network Error），通常是后端没启动或端口不对。',
+    '',
+    `1) 先确认后端能打开：${clean}/`,
+    '2) 如果你在使用桌面版：请先确认后端已启动（通常端口会在 8002-8007 之间自动选择）。',
+    '3) 如果你在使用 HTML 版：请运行目录内的 start.command/start-macos.command 先启动后端。',
+  ].join('\n');
+};
+
+const isNetworkError = (err: any) => {
+  const msg = err?.message || '';
+  return !err?.response && String(msg || '').toLowerCase().includes('network');
+};
+
+function App() {
+  const [activeTab, setActiveTab] = useState('process');
+  const [activeResultTab, setActiveResultTab] = useState<'preapprove'>('preapprove');
+  const [apiBase, setApiBase] = useState<string>(API_BASE);
+  const [authLoading, setAuthLoading] = useState(false);
+  const [historyReloadKey, setHistoryReloadKey] = useState(0);
+  const [historyImporting, setHistoryImporting] = useState(false);
+  const [importByUrl, setImportByUrl] = useState(true);
+  const [importByJson, setImportByJson] = useState(false);
+  const [jsonImportFiles, setJsonImportFiles] = useState<File[]>([]);
+  const [jsonImportPreview, setJsonImportPreview] = useState<{ fileCount: number; itemCount: number } | null>(null);
+  const [lastJsonMeta, setLastJsonMeta] = useState<{ base: string; count: number } | null>(null);
+  
+  // Backend service state
+  const [backendRunning, setBackendRunning] = useState(false);
+  const [backendLoading, setBackendLoading] = useState(false);
+  const [backendStatus, setBackendStatus] = useState<any>(null);
+  const [logLevel, setLogLevel] = useState<'all' | 'stdout' | 'stderr'>('all');
+  const [logKeyword, setLogKeyword] = useState('');
+  const [logs, setLogs] = useState<any[]>([]);
+  const [metrics, setMetrics] = useState<any>(null);
+  
+  // Custom skills from local folder
+  const [customSkills, setCustomSkills] = useState<{name: string, content: string}[]>([]);
+  const [selectedSkillName, setSelectedSkillName] = useState<string>('');
+  const [abFocusRecordId, setAbFocusRecordId] = useState<string | null>(null);
+  
+  // LLM Config state
+  const [llmProfile, setLlmProfile] = useState<'default' | 'A' | 'B' | 'J'>('default');
+  const [config, setConfig] = useState({
+    api_token: '',
+    base_url: 'https://api.openai.com',
+    model: 'gpt-3.5-turbo',
+    timeout: 60,
+    retry: 3,
+    authorized: false
+  });
+  const [configStatus, setConfigStatus] = useState('');
+
+  // Process state
+  const [batchInput, setBatchInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState<any>(null);
+  const [error, setError] = useState('');
+  const [authModal, setAuthModal] = useState(false);
+  const [historyQuery, setHistoryQuery] = useState('');
+  const [historyEvents, setHistoryEvents] = useState<any[]>([]);
+  const [historySelected, setHistorySelected] = useState<any>(null);
+  const [historyItems, setHistoryItems] = useState<any[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [drillEnabled, setDrillEnabled] = useState(false);
+  const [drillDepth, setDrillDepth] = useState(3);
+  const [jsonConcurrency, setJsonConcurrency] = useState<number>(8);
+
+  // 初始化加载数据
+  useEffect(() => {
+    if (isDesktopApp()) return;
+    if (API_BASE_FROM_ENV) return;
+    try {
+      const v = (localStorage.getItem(WEB_API_BASE_STORAGE_KEY) || '').trim();
+      if (v) setApiBase(v);
+    } catch (_) {}
+  }, []);
+
+  useEffect(() => {
+    if (isDesktopApp()) return;
+    if (API_BASE_FROM_ENV) return;
+    let originBase = '';
+    try {
+      originBase = normalizeApiBase(String(window.location?.origin || ''));
+    } catch (_) {
+      originBase = '';
+    }
+    if (!originBase) return;
+
+    let cancelled = false;
+    const tryProbeOrigin = async () => {
+      try {
+        const res = await fetch(`${originBase}/api/llm/config`, { method: 'GET' });
+        if (cancelled) return;
+        if (res.ok) {
+          setApiBase(originBase);
+          try {
+            localStorage.setItem(WEB_API_BASE_STORAGE_KEY, originBase);
+          } catch (_) {}
+        }
+      } catch (_) {}
+    };
+
+    tryProbeOrigin();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (API_BASE_FROM_ENV) return;
+    if (isDesktopApp()) return;
+    if (!isProbablyElectron()) return;
+
+    let cancelled = false;
+    const tryProbe = async () => {
+      const candidates = [8000, 8002, 8003, 8004, 8005, 8006, 8007, 8001, 8008, 8009, 8010];
+      for (const port of candidates) {
+        if (cancelled) return;
+        const base = `http://127.0.0.1:${port}`;
+        try {
+          const ctrl = new AbortController();
+          const t = setTimeout(() => ctrl.abort(), 800);
+          const res = await fetch(`${base}/api/llm/config`, { method: 'GET', signal: ctrl.signal });
+          clearTimeout(t);
+          if (res.ok) {
+            setApiBase(base);
+            try {
+              localStorage.setItem(WEB_API_BASE_STORAGE_KEY, base);
+            } catch (_) {}
+            return;
+          }
+        } catch (_) {}
+      }
+    };
+    tryProbe();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // 读取上一次 JSON 选择记录（仅用于提示，不会自动读取文件内容）
+  useEffect(() => {
+    if (isDesktopApp()) return;
+    try {
+      const rawCount = localStorage.getItem('AI_DCP_LAST_JSON_COUNT') || '';
+      const rawBase = localStorage.getItem('AI_DCP_LAST_JSON_BASE') || '';
+      const count = Number(rawCount || '0');
+      const base = (rawBase || '').trim();
+      if (count > 0 || base) setLastJsonMeta({ base, count: Number.isFinite(count) ? count : 0 });
+    } catch (_) {}
+  }, []);
+
+  // 从 URL hash 初始化当前 Tab（用于 HTML 版刷新后保持位置）
+  useEffect(() => {
+    if (isDesktopApp()) return;
+    try {
+      const hash = (window.location.hash || '').replace(/^#/, '').trim();
+      if (!hash) return;
+      const [rootRaw, subRaw] = hash.split(/[/:]/g).filter(Boolean);
+      const root = String(rootRaw || '').trim();
+      const sub = String(subRaw || '').trim();
+      if (root === 'preapprove') {
+        setActiveTab('results');
+        setActiveResultTab('preapprove');
+        return;
+      }
+      if (root === 'results') {
+        setActiveTab('results');
+        if (sub === 'preapprove') setActiveResultTab('preapprove');
+        return;
+      }
+      setActiveTab(root);
+    } catch (_) {}
+  }, []);
+
+  // 切换 Tab 时同步到 URL hash（仅 Web）
+  useEffect(() => {
+    if (isDesktopApp()) return;
+    try {
+      if (!activeTab) return;
+      const nextHash = activeTab === 'results' ? `results/${activeResultTab}` : activeTab;
+      window.history.replaceState(null, '', `#${nextHash}`);
+    } catch (_) {}
+  }, [activeTab, activeResultTab]);
+
+  useEffect(() => {
+    if (isDesktopApp()) return;
+    try {
+      localStorage.setItem(WEB_API_BASE_STORAGE_KEY, normalizeApiBase(apiBase));
+    } catch (_) {}
+  }, [apiBase]);
+
+  useEffect(() => {
+    // 获取保存的 LLM 配置
+    const fetchConfig = async () => {
+      try {
+        const base = normalizeApiBase(apiBase);
+        try {
+          const r2 = await axios.get(`${base}/api/llm/profiles/${encodeURIComponent(llmProfile)}`);
+          const cfg = r2.data?.config || {};
+          if (Object.keys(cfg).length > 0) setConfig(prev => ({ ...prev, ...cfg }));
+          return;
+        } catch (_) {}
+        const res = await axios.get(`${base}/api/llm/config`);
+        if (Object.keys(res.data || {}).length > 0) setConfig(prev => ({ ...prev, ...res.data }));
+      } catch (err) {
+        console.error("无法获取配置", err);
+      }
+    };
+
+    if (!isValidApiBase(apiBase)) return;
+    if (isDesktopApp() && backendStatus?.state !== 'running') return;
+    fetchConfig();
+  }, [apiBase, backendStatus?.state, llmProfile]);
+
+  useEffect(() => {
+    if (!isDesktopApp()) return;
+    const api = getDesktopApi();
+    if (!api) return;
+    let cancel = false;
+    const refresh = async () => {
+      try {
+        const st = await api.getBackendStatus();
+        if (cancel) return;
+        setBackendStatus(st);
+        setBackendRunning(st?.state === 'running');
+        if (st?.apiBase) setApiBase(st.apiBase);
+      } catch (_) {}
+    };
+    refresh();
+    const unsub = api.onBackendStatus((st: any) => {
+      setBackendStatus(st);
+      setBackendRunning(st?.state === 'running');
+      setBackendLoading(false);
+      if (st?.apiBase) setApiBase(st.apiBase);
+    });
+    return () => {
+      cancel = true;
+      unsub?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isDesktopApp()) return;
+    const api = getDesktopApi();
+    if (!api) return;
+    const unsub = api.onBackendLog((log: any) => {
+      setLogs((prev) => {
+        const next = [...prev, log];
+        if (next.length > 2000) return next.slice(next.length - 2000);
+        return next;
+      });
+    });
+    return () => {
+      unsub?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isDesktopApp()) return;
+    const api = getDesktopApi();
+    if (!api) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const m = await api.getBackendMetrics();
+        if (cancelled) return;
+        setMetrics(m);
+      } catch (_) {}
+    };
+    tick();
+    const t = window.setInterval(tick, 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, []);
+
+  // 控制后端服务
+  const handleBackendToggle = () => {
+    const api = getDesktopApi();
+    if (!api) return;
+    setBackendLoading(true);
+    if (backendRunning) {
+      api.stopBackend().finally(() => setBackendLoading(false));
+    } else {
+      api.startBackend().finally(() => setBackendLoading(false));
+    }
+  };
+
+  const handleBackendRestart = () => {
+    const api = getDesktopApi();
+    if (!api) return;
+    setBackendLoading(true);
+    api.restartBackend().finally(() => setBackendLoading(false));
+  };
+
+  const handleOpenWebView = async () => {
+    const api = getDesktopApi();
+    if (!api) return;
+    await api.openWebView({ url: 'https://oa.ksyun.com' });
+  };
+
+  const handleBackendAuth = async (force: boolean) => {
+    setBackendLoading(true);
+    try {
+      await axios.post(`${apiBase}/api/auth/start`, force ? { force: true } : {});
+      alert('授权完成：已保存登录态。现在可以开始抓取内部页面。');
+    } catch (err: any) {
+      const msg = err?.response?.data?.detail || err?.message || '授权失败，请重试';
+      alert(msg);
+    } finally {
+      setBackendLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (activeTab !== 'history') return;
+
+    const mergeEvents = (prev: any[], incoming: any[]) => {
+      const map = new Map<number, any>();
+      prev.forEach(e => map.set(e.id, e));
+      incoming.forEach(e => {
+        const old = map.get(e.id) || {};
+        map.set(e.id, { ...old, ...e });
+      });
+      return Array.from(map.values()).sort((a, b) => (b.ts || 0) - (a.ts || 0));
+    };
+
+    const fetchHistory = async (silent: boolean) => {
+      if (!silent) setHistoryLoading(true);
+      try {
+        const res = await axios.get(`${apiBase}/api/history/events`, {
+          params: {
+            q: historyQuery || undefined,
+            limit: 50,
+            offset: 0,
+          }
+        });
+        const incoming = res.data.events || [];
+        setHistoryEvents(prev => mergeEvents(prev, incoming));
+        setHistorySelected((prev: any) => {
+          if (!prev) return prev;
+          const hit = incoming.find((e: any) => e.id === prev.id);
+          return hit ? { ...prev, ...hit } : prev;
+        });
+      } catch (err: any) {
+        setError(err.response?.data?.detail || err.message || '加载任务记录失败');
+      } finally {
+        if (!silent) setHistoryLoading(false);
+      }
+    };
+
+    fetchHistory(false);
+    const timer = window.setInterval(() => {
+      fetchHistory(true);
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [activeTab, historyQuery, apiBase, historyReloadKey]);
+
+  useEffect(() => {
+    if (activeTab !== 'history') return;
+    if (!historySelected?.id) return;
+    const shouldPoll = historySelected.status === 'running' || historySelected.status === 'queued';
+    if (!shouldPoll) return;
+    let cancelled = false;
+    const fetchDetail = async () => {
+      try {
+        const res = await axios.get(`${apiBase}/api/history/events/${historySelected.id}`);
+        if (cancelled) return;
+        setHistorySelected(res.data.event);
+        setHistoryItems(res.data.items || []);
+      } catch (err) {
+        return;
+      }
+    };
+    fetchDetail();
+    const t = window.setInterval(fetchDetail, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, [activeTab, historySelected?.id, historySelected?.status, apiBase]);
+
+  const handleDesktopImportHistory = async () => {
+    try {
+      const api = getDesktopApi();
+      if (!api || !api.pickHistoryDbs) {
+        alert('当前不是桌面版环境，无法直接导入。请使用桌面 App 进行导入。');
+        return;
+      }
+      if (!isValidApiBase(apiBase)) {
+        alert('当前后端地址不可用，请先启动后端或检查端口配置');
+        return;
+      }
+      const base = normalizeApiBase(apiBase);
+      const picked = await api.pickHistoryDbs();
+      if (!picked || picked.canceled) return;
+      const paths = picked.filePaths || [];
+      if (paths.length === 0) return;
+
+      let historyPath = '';
+      let drillPath = '';
+      for (const p of paths) {
+        const lower = String(p || '').toLowerCase();
+        if (!historyPath && (lower.endsWith('/history.db') || lower.endsWith('\\history.db') || lower.includes('history'))) {
+          historyPath = p;
+        } else if (!drillPath && (lower.endsWith('/drill.db') || lower.endsWith('\\drill.db') || lower.includes('drill'))) {
+          drillPath = p;
+        } else if (!historyPath) {
+          historyPath = p;
+        }
+      }
+
+      setHistoryImporting(true);
+      const res = await axios.post(`${base}/api/history/import-path`, {
+        history_db_path: historyPath || undefined,
+        drill_db_path: drillPath || undefined,
+      });
+      const imported = res?.data?.imported || [];
+      const skipped = res?.data?.skipped || [];
+      setHistoryEvents([]);
+      setHistoryItems([]);
+      setHistorySelected(null);
+      setHistoryReloadKey((k) => k + 1);
+      alert(`导入完成：成功 ${imported.length} 项，跳过/失败 ${skipped.length} 项。`);
+    } catch (err: any) {
+      const msg = err?.response?.data?.detail || err?.message || '导入失败';
+      alert(msg);
+    } finally {
+      setHistoryImporting(false);
+    }
+  };
+
+  // 处理本地文件夹选择
+  const handleFolderSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files) return;
+
+    const map: Record<string, { skillMd?: string; others: { name: string; content: string }[] }> = {};
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const rel = (file as any).webkitRelativePath || file.name;
+      const parts = rel.split('/');
+      const folder = parts.length > 1 ? parts[0] : 'root';
+      map[folder] = map[folder] || { others: [] };
+
+      const lower = file.name.toLowerCase();
+      if (lower === 'skill.md') {
+        map[folder].skillMd = await file.text();
+      } else if (lower.endsWith('.md') || lower.endsWith('.markdown')) {
+        map[folder].others.push({ name: file.name, content: await file.text() });
+      } else if (lower.endsWith('.yaml') || lower.endsWith('.yml')) {
+        map[folder].others.push({ name: file.name, content: await file.text() });
+      }
+    }
+
+    const skills: { name: string; content: string }[] = [];
+    Object.entries(map).forEach(([folder, v]) => {
+      const base = (v.skillMd || '').trim();
+      if (!base) return;
+      const appendix = (v.others || [])
+        .filter(x => x.name.toLowerCase() !== 'skill.md')
+        .map(x => `\n\n---\n\n# ${x.name}\n\n${x.content}`.trim())
+        .join('\n');
+      const merged = `${base}${appendix ? `\n\n${appendix}` : ''}`.trim();
+      skills.push({ name: folder, content: merged });
+    });
+
+    setCustomSkills(skills);
+    const firstName = skills.length > 0 ? skills[0].name : '';
+    setSelectedSkillName(firstName);
+    try {
+      if (firstName) localStorage.setItem('AI_DCP_LAST_SKILL_NAME', firstName);
+    } catch (_) {}
+  };
+
+  const handleSkillFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    const file = files[0];
+    const content = await file.text();
+    const name = file.name.toLowerCase().endsWith('.md')
+      ? file.name.replace(/\.md$/i, '')
+      : file.name;
+    setCustomSkills([{ name, content }]);
+    setSelectedSkillName(name);
+    try {
+      if (name) localStorage.setItem('AI_DCP_LAST_SKILL_NAME', name);
+    } catch (_) {}
+  };
+
+  // 保存 LLM 配置
+  const handleSaveConfig = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      const base = normalizeApiBase(apiBase);
+      try {
+        await axios.post(`${base}/api/llm/profiles/${encodeURIComponent(llmProfile)}`, config);
+      } catch (_) {
+        await axios.post(`${base}/api/llm/config`, config);
+      }
+      setConfigStatus('success');
+      setTimeout(() => setConfigStatus(''), 3000);
+    } catch (err) {
+      setConfigStatus('error');
+    }
+  };
+
+  const handleManualAuthorizeAccess = async () => {
+    if (isDesktopApp()) {
+      setActiveTab('desktop');
+      return;
+    }
+    if (!isValidApiBase(apiBase)) {
+      alert('当前后端地址不可用，请先启动后端或检查端口配置');
+      return;
+    }
+    const base = normalizeApiBase(apiBase);
+    const shouldForce = config.authorized
+      ? window.confirm('检测到你之前已授权过。是否重新授权（会重新打开登录浏览器）？')
+      : false;
+    setAuthLoading(true);
+    try {
+      await axios.post(`${base}/api/auth/start`, shouldForce ? { force: true } : {});
+      setConfig(prev => ({ ...prev, authorized: true }));
+      setAuthModal(false);
+      alert('授权完成：已保存登录态。现在可以访问需要登录的页面。');
+    } catch (err: any) {
+      const status = Number(err?.response?.status);
+      let msg = err?.response?.data?.detail || err?.message || '授权失败，请重试';
+      if (status === 409) {
+        msg = '浏览器配置正在被使用（可能正在跑批量任务/或上一次授权窗口未关闭）。请先等待任务结束并关闭授权窗口后，再重试授权。';
+      }
+      if (isNetworkError(err)) {
+        alert(formatBackendStartHelp(base));
+      } else {
+        alert(msg);
+      }
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const hasInternalAuthUrls = (allUrls: string[]) => {
+    return (allUrls || []).some((u) => {
+      const raw = String(u || '').trim();
+      if (!raw) return false;
+      try {
+        return new URL(raw).hostname === 'oa.ksyun.com';
+      } catch (_) {
+        return raw.includes('oa.ksyun.com');
+      }
+    });
+  };
+
+  const formatJsonfileUrlForDisplay = (rawUrl: string) => {
+    const u = String(rawUrl || '');
+    if (!u.startsWith('jsonfile://')) return u;
+    const rest = u.slice('jsonfile://'.length);
+    try {
+      return `jsonfile://${decodeURIComponent(rest)}`;
+    } catch (_) {
+      return u;
+    }
+  };
+
+  // 提交爬取并处理的任务
+  const handleProcessTask = async (e: React.FormEvent) => {
+    e.preventDefault();
+
+    const base = normalizeApiBase(apiBase);
+    if (!isValidApiBase(apiBase)) {
+      setError('当前后端地址不可用，请先启动后端或检查端口配置');
+      return;
+    }
+
+    setLoading(true);
+    setError('');
+    setResult(null);
+    
+    try {
+      if (!importByUrl && !importByJson) {
+        throw new Error('请至少勾选一种导入方式（URL / JSON）');
+      }
+
+      let urls: string[] = [];
+      let jsonInputs: any[] = [];
+
+      if (importByUrl) {
+        const lines = batchInput.split('\n').map(l => l.trim()).filter(l => l);
+        urls = lines;
+      }
+
+      if (importByJson) {
+        if (!jsonImportFiles || jsonImportFiles.length === 0) throw new Error('已勾选 JSON 导入，但未选择 JSON 文件');
+        const items: any[] = [];
+        for (const f of jsonImportFiles) {
+          const name = String(f?.name || 'upload.json');
+          let obj: any = null;
+          try {
+            const text = await f.text();
+            obj = JSON.parse(text);
+          } catch (e2) {
+            throw new Error(`JSON 文件解析失败：${name}`);
+          }
+          const urlFromObj = obj && typeof obj === 'object' ? String((obj as any).url || '').trim() : '';
+          const url = urlFromObj || `jsonfile://${name}`;
+          items.push({
+            url,
+            payload: obj,
+            meta: { source: 'json_file', filename: name },
+          });
+        }
+        jsonInputs = items;
+      }
+
+      if (urls.length === 0 && jsonInputs.length === 0) {
+        throw new Error('未解析到可导入的数据：URL=0，JSON=0');
+      }
+
+      const allUrlsForAuthCheck = [
+        ...urls,
+        ...jsonInputs.map((x) => String(x?.url || '').trim()).filter((x) => x),
+      ];
+      const needAuth = hasInternalAuthUrls(allUrlsForAuthCheck);
+
+      if (needAuth && !config.authorized) {
+        if (isDesktopApp()) {
+          setError('桌面版请先到「控制台」完成授权登录（并确保后端为 running），再执行批量任务');
+          setAuthModal(false);
+          setActiveTab('desktop');
+          return;
+        }
+
+        let ok = false;
+        try {
+          const st = await axios.get(`${base}/api/auth/status`);
+          ok = !!st?.data?.authorized;
+        } catch (_) {
+          try {
+            const cfg = await axios.get(`${base}/api/llm/config`);
+            ok = !!cfg?.data?.authorized;
+          } catch (err2: any) {
+            if (isNetworkError(err2)) {
+              alert(formatBackendStartHelp(base));
+            } else {
+              const msg = err2?.response?.data?.detail || err2?.message || '无法确认授权状态';
+              setError(msg);
+            }
+            return;
+          }
+        }
+
+        if (ok) {
+          setConfig(prev => ({ ...prev, authorized: true }));
+        } else {
+          setAuthModal(true);
+          return;
+        }
+      }
+
+      // 构造请求数据，一并发送所选技能的内容
+      const custom_skills_dict: Record<string, string> = {};
+      customSkills.forEach(s => {
+        custom_skills_dict[s.name] = s.content;
+      });
+      
+      const payload: any = {
+        urls: urls.length ? urls : undefined,
+        json_inputs: jsonInputs.length ? jsonInputs : undefined,
+        custom_skills: Object.keys(custom_skills_dict).length > 0 ? custom_skills_dict : undefined,
+        skill_name: selectedSkillName || undefined,
+        json_concurrency: importByJson ? (Number.isFinite(jsonConcurrency) && jsonConcurrency >= 1 ? Math.floor(jsonConcurrency) : 8) : undefined,
+        drill_config: drillEnabled
+          ? {
+              enabled: true,
+              max_depth: Number.isFinite(drillDepth) && drillDepth >= 1 ? Math.floor(drillDepth) : 3,
+            }
+          : { enabled: false },
+      };
+      
+      const res = await axios.post(`${base}/api/task/batch-ingest`, payload);
+      setResult(res.data);
+    } catch (err: any) {
+      setError(err.response?.data?.detail || err.message || '处理失败');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleAddToAB = async () => {
+    const base = normalizeApiBase(apiBase);
+    if (!isValidApiBase(apiBase)) {
+      alert('当前后端地址不可用，请先启动后端或检查端口配置');
+      return;
+    }
+
+    try {
+      if (!importByUrl && !importByJson) {
+        throw new Error('请至少勾选一种导入方式（URL / JSON）');
+      }
+
+      let urls: string[] = [];
+      let jsonInputs: any[] = [];
+
+      if (importByUrl) {
+        const lines = batchInput.split('\n').map(l => l.trim()).filter(l => l);
+        urls = lines;
+      }
+
+      if (importByJson) {
+        if (!jsonImportFiles || jsonImportFiles.length === 0) throw new Error('已勾选 JSON 导入，但未选择 JSON 文件');
+        const items: any[] = [];
+        for (const f of jsonImportFiles) {
+          const name = String(f?.name || 'upload.json');
+          let obj: any = null;
+          try {
+            const text = await f.text();
+            obj = JSON.parse(text);
+          } catch (e2) {
+            throw new Error(`JSON 文件解析失败：${name}`);
+          }
+          const urlFromObj = obj && typeof obj === 'object' ? String((obj as any).url || '').trim() : '';
+          const url = urlFromObj || `jsonfile://${name}`;
+          items.push({
+            url,
+            payload: obj,
+            meta: { source: 'json_file', filename: name },
+          });
+        }
+        jsonInputs = items;
+      }
+
+      if (urls.length === 0 && jsonInputs.length === 0) {
+        throw new Error('未解析到可导入的数据：URL=0，JSON=0');
+      }
+
+      const custom_skills_dict: Record<string, string> = {};
+      customSkills.forEach(s => {
+        custom_skills_dict[s.name] = s.content;
+      });
+
+      const payload: any = {
+        title: `来自任务页-${new Date().toISOString()}`,
+        urls: urls.length ? urls : undefined,
+        json_inputs: jsonInputs.length ? jsonInputs : undefined,
+        custom_skills: Object.keys(custom_skills_dict).length > 0 ? custom_skills_dict : undefined,
+        skill_name: selectedSkillName || undefined,
+        drill_config: drillEnabled
+          ? {
+              enabled: true,
+              max_depth: Number.isFinite(drillDepth) && drillDepth >= 1 ? Math.floor(drillDepth) : 3,
+            }
+          : { enabled: false },
+        criteria: '',
+      };
+
+      const res = await axios.post(`${base}/api/ab/records`, payload);
+      const recordId = String(res.data?.record?.id || '').trim();
+      if (recordId) {
+        setAbFocusRecordId(recordId);
+        setActiveTab('ab');
+      } else {
+        alert('已创建记录，但未返回 record_id，请到 A/B Test 页刷新查看');
+        setActiveTab('ab');
+      }
+    } catch (err: any) {
+      alert(err?.response?.data?.detail || err?.message || '加入 AB 评审失败');
+    }
+  };
+
+  const handleAuth = async () => {
+    try {
+      if (!isValidApiBase(apiBase)) {
+        alert('当前后端地址不可用，请先启动后端或检查端口配置');
+        return;
+      }
+      const base = normalizeApiBase(apiBase);
+      await axios.post(`${base}/api/auth/start`);
+      setConfig(prev => ({ ...prev, authorized: true }));
+      setAuthModal(false);
+    } catch (err: any) {
+      const msg = err?.response?.data?.detail || err?.message || "授权失败，请重试";
+      if (isNetworkError(err)) {
+        alert(formatBackendStartHelp(apiBase));
+      } else {
+        alert(msg);
+      }
+    }
+  };
+
+  const handleCancelAuth = () => {
+    setAuthModal(false);
+    alert("您已拒绝授权。程序需要浏览器授权才能抓取内部页面，请稍后重试。");
+  };
+
+  const handleSelectHistory = async (eventId: number) => {
+    setHistoryLoading(true);
+    try {
+      const res = await axios.get(`${apiBase}/api/history/events/${eventId}`);
+      setHistorySelected(res.data.event);
+      setHistoryItems(res.data.items || []);
+    } catch (err: any) {
+      setError(err.response?.data?.detail || err.message || '加载历史详情失败');
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const handleOpenHistoryPath = async (eventId: number) => {
+    try {
+      await axios.post(`${apiBase}/api/history/open`, { event_id: eventId });
+    } catch (err: any) {
+      setError(err.response?.data?.detail || err.message || '打开路径失败');
+    }
+  };
+
+  const handleRetryFailed = async (eventId: number) => {
+    try {
+      if (!eventId) return;
+      const res = await axios.post(`${apiBase}/api/history/events/${eventId}/retry_failed`, { only_failed: true });
+      const newId = Number(res.data?.event_id || 0);
+      if (Number.isFinite(newId) && newId > 0) {
+        setHistoryReloadKey((k) => k + 1);
+        setActiveTab('history');
+        await handleSelectHistory(newId);
+      } else {
+        alert('已发起重试，但未返回新的 event_id，请到任务监控页刷新查看');
+      }
+    } catch (err: any) {
+      alert(err?.response?.data?.detail || err?.message || '重试失败');
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-brand-bg text-brand-text font-sans antialiased selection:bg-brand-primary/30">
+      <header className="sticky top-0 z-50 bg-white/80 backdrop-blur-md shadow-sm border-b border-white/20">
+        <div className="max-w-5xl mx-auto px-6 py-4">
+          <div className="flex items-center justify-between gap-6">
+            <h1 className="text-2xl font-bold font-serif text-brand-text flex items-center gap-3 shrink-0">
+              <div className="bg-brand-primary p-2 rounded-xl text-white shadow-soft">
+                <TerminalSquare className="w-5 h-5" />
+              </div>
+              AI-DCP Intelligence
+            </h1>
+            <div className="flex items-center gap-4 flex-wrap justify-end">
+              <Button
+                onClick={handleManualAuthorizeAccess}
+                variant="cta"
+                isLoading={authLoading}
+                className="flex items-center gap-2"
+                title={isDesktopApp() ? '桌面版请在控制台完成授权' : '手动打开授权登录浏览器，获取 Cookie/Storage'}
+              >
+                <Globe className="w-4 h-4" />
+                手动授权访问
+              </Button>
+              {isDesktopApp() && (
+                <Button
+                  onClick={handleBackendToggle}
+                  variant={backendRunning ? 'secondary' : 'primary'}
+                  isLoading={backendLoading}
+                  className="flex items-center gap-2"
+                >
+                  {backendLoading ? (
+                    <Activity className="w-4 h-4 animate-spin" />
+                  ) : backendRunning ? (
+                    <Power className="w-4 h-4" />
+                  ) : (
+                    <Power className="w-4 h-4" />
+                  )}
+                  {backendRunning ? '停止后端' : '启动后端'}
+                </Button>
+              )}
+            </div>
+          </div>
+
+          <div className="mt-4 flex flex-col gap-3">
+            <div className="flex flex-col gap-3 md:flex-row md:items-center md:gap-4">
+              <div className="flex-1 overflow-x-auto">
+                {(() => {
+                  const flowTabs = [
+                    { key: 'process', label: '任务创建', aria: '切换到任务创建' },
+                    { key: 'history', label: '任务监控', aria: '切换到任务监控' },
+                    { key: 'mb', label: '人机评测', aria: '切换到人机评测' },
+                    { key: 'ab', label: 'A/B Test', aria: '切换到A/B Test' },
+                  ];
+                  const activeIdx = flowTabs.findIndex((t) => t.key === activeTab);
+                  return (
+                    <div className="flex items-center gap-3 bg-white/60 border border-gray-200/60 rounded-2xl px-3 py-2 min-w-[680px]">
+                      {flowTabs.map((t, idx) => {
+                        const isActive = activeTab === t.key;
+                        const isDone = activeIdx >= 0 && idx < activeIdx;
+                        const dotClass = isActive
+                          ? 'bg-brand-primary text-white shadow-soft'
+                          : isDone
+                            ? 'bg-brand-secondary text-white'
+                            : 'bg-gray-100 text-gray-500';
+                        const textClass = isActive ? 'text-brand-text' : isDone ? 'text-brand-text/80' : 'text-gray-500';
+                        const lineClass = isDone ? 'bg-brand-secondary/70' : 'bg-gray-200';
+                        return (
+                          <div key={t.key} className="flex items-center gap-3">
+                            <button
+                              type="button"
+                              onClick={() => setActiveTab(t.key)}
+                              className="group flex items-center gap-2 px-2 py-1 rounded-xl hover:bg-white/70 transition-all duration-300"
+                              aria-label={t.aria}
+                            >
+                              <span className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold transition-all duration-300 ${dotClass}`}>
+                                {isDone ? <CheckCircle className="w-4 h-4" /> : idx + 1}
+                              </span>
+                              <span className={`text-sm font-semibold whitespace-nowrap transition-all duration-300 ${textClass}`}>{t.label}</span>
+                            </button>
+                            {idx < flowTabs.length - 1 && <div className={`w-10 h-px ${lineClass}`} />}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
+              </div>
+
+              <nav className="flex gap-2 bg-gray-100/50 p-1 rounded-xl border border-gray-200/50 shrink-0">
+                <button
+                  onClick={() => setActiveTab('results')}
+                  className={`px-4 py-2 rounded-lg text-sm font-medium transition-all duration-300 ${activeTab === 'results' ? 'bg-white shadow-sm text-brand-text' : 'text-gray-500 hover:text-brand-text hover:bg-white/50'}`}
+                  aria-label="切换到结果呈现"
+                >
+                  结果呈现
+                </button>
+                {isDesktopApp() && (
+                  <button
+                    onClick={() => setActiveTab('desktop')}
+                    className={`px-4 py-2 rounded-lg text-sm font-medium transition-all duration-300 ${activeTab === 'desktop' ? 'bg-white shadow-sm text-brand-text' : 'text-gray-500 hover:text-brand-text hover:bg-white/50'}`}
+                    aria-label="切换到桌面控制台"
+                  >
+                    控制台
+                  </button>
+                )}
+                <button
+                  onClick={() => setActiveTab('config')}
+                  className={`px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-all duration-300 ${activeTab === 'config' ? 'bg-white shadow-sm text-brand-text' : 'text-gray-500 hover:text-brand-text hover:bg-white/50'}`}
+                  aria-label="切换到LLM配置"
+                >
+                  <Settings className="w-4 h-4" /> LLM配置
+                </button>
+              </nav>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-5xl mx-auto px-6 py-10">
+        {activeTab === 'config' && (
+          <Card className="max-w-2xl mx-auto transform transition-all duration-500 animate-in fade-in slide-in-from-bottom-4">
+            <h2 className="text-2xl font-serif font-bold mb-8 flex items-center gap-2">大语言模型 (LLM) 配置</h2>
+            <form onSubmit={handleSaveConfig} className="space-y-6">
+              {!isDesktopApp() && (
+                <Input
+                  label="后端地址 (API_BASE)"
+                  type="url"
+                  value={apiBase}
+                  onChange={(e: any) => setApiBase(e.target.value)}
+                  required
+                  helperText="示例: http://127.0.0.1:8000 （不要填 https://oa.ksyun.com）"
+                />
+              )}
+              <div>
+                <label className="block text-sm font-semibold text-[#2D3436] mb-1">配置对象（LLM Profile）</label>
+                <select
+                  value={llmProfile}
+                  onChange={(e) => setLlmProfile(e.target.value as any)}
+                  className="w-full px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50/50 text-[#2D3436] focus:bg-white focus:border-[#E8B4B8] focus:ring-4 focus:ring-[#E8B4B8]/20 outline-none"
+                >
+                  <option value="default">default（普通任务）</option>
+                  <option value="A">A（评审-A）</option>
+                  <option value="B">B（评审-B）</option>
+                  <option value="J">J（评审-Judge）</option>
+                </select>
+                <div className="mt-1 text-xs text-gray-500">
+                  AB 评审会分别使用 A/B/J；普通任务使用 default。模型名称支持例如 glm-5.1 这种字符串。
+                </div>
+              </div>
+              <Input
+                label="API Token"
+                type="password"
+                value={config.api_token}
+                onChange={(e: any) => setConfig({ ...config, api_token: e.target.value })}
+                required
+                helperText="请安全输入您的 Token"
+              />
+              <Input
+                label="Base URL"
+                type="url"
+                value={config.base_url}
+                onChange={(e: any) => setConfig({ ...config, base_url: e.target.value })}
+                required
+              />
+              <Input
+                label="模型名称"
+                type="text"
+                value={config.model}
+                onChange={(e: any) => setConfig({ ...config, model: e.target.value })}
+                required
+              />
+              <div className="grid grid-cols-2 gap-6">
+                <Input
+                  label="超时时间 (秒)"
+                  type="number"
+                  value={config.timeout}
+                  onChange={(e: any) => setConfig({ ...config, timeout: Number(e.target.value) })}
+                />
+                <Input
+                  label="重试次数"
+                  type="number"
+                  value={config.retry}
+                  onChange={(e: any) => setConfig({ ...config, retry: Number(e.target.value) })}
+                />
+              </div>
+              <div className="pt-4 flex items-center gap-4">
+                <Button type="submit" variant="primary">
+                  保存配置
+                </Button>
+                {configStatus === 'success' && <span className="text-brand-secondary flex items-center gap-1 font-medium animate-in fade-in slide-in-from-left-2"><CheckCircle className="w-4 h-4"/> 已保存</span>}
+                {configStatus === 'error' && <span className="text-red-500 flex items-center gap-1 font-medium animate-in fade-in slide-in-from-left-2"><AlertCircle className="w-4 h-4"/> 保存失败</span>}
+              </div>
+            </form>
+          </Card>
+        )}
+
+        {activeTab === 'results' && (
+          <div className="transform transition-all duration-500 animate-in fade-in slide-in-from-bottom-4">
+            <div className="flex items-center justify-between gap-4 mb-6 flex-wrap">
+              <h2 className="text-2xl font-serif font-bold">结果呈现</h2>
+              <div className="flex gap-2 bg-gray-100/50 p-1 rounded-xl border border-gray-200/50">
+                <button
+                  type="button"
+                  onClick={() => setActiveResultTab('preapprove')}
+                  className={`px-4 py-2 rounded-lg text-sm font-medium transition-all duration-300 ${activeResultTab === 'preapprove' ? 'bg-white shadow-sm text-brand-text' : 'text-gray-500 hover:text-brand-text hover:bg-white/50'}`}
+                  aria-label="切换到预审批Demo"
+                >
+                  预审批 Demo
+                </button>
+              </div>
+            </div>
+            {activeResultTab === 'preapprove' && <PreApprovalDemoPage apiBase={normalizeApiBase(apiBase)} />}
+          </div>
+        )}
+
+        {activeTab === 'ab' && (
+          <ABReviewPage
+            apiBase={normalizeApiBase(apiBase)}
+            focusRecordId={abFocusRecordId}
+            onFocusConsumed={() => setAbFocusRecordId(null)}
+          />
+        )}
+
+        {activeTab === 'mb' && (
+          <MbBatchAnalysisPage apiBase={normalizeApiBase(apiBase)} />
+        )}
+
+        {activeTab === 'process' && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 transform transition-all duration-500 animate-in fade-in slide-in-from-bottom-4">
+            <Card className="lg:col-span-5 h-fit sticky top-28">
+              <h2 className="text-2xl font-serif font-bold mb-8 flex items-center gap-2">
+                <List className="w-6 h-6 text-brand-primary" /> 任务创建
+              </h2>
+              <div className="mb-4 text-xs text-gray-500 break-all">后端地址: {normalizeApiBase(apiBase)}</div>
+              <form onSubmit={handleProcessTask} className="space-y-6">
+                <div className="space-y-3">
+                  <label className="block text-sm font-semibold text-[#2D3436]">数据导入方式</label>
+                  <div className="flex flex-wrap gap-4">
+                    <label className="flex items-center gap-2 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={importByUrl}
+                        onChange={(e) => setImportByUrl(e.target.checked)}
+                        className="h-4 w-4 rounded border-gray-300 text-brand-primary focus:ring-brand-cta"
+                      />
+                      <span className="text-sm font-semibold text-brand-text">URL 导入</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={importByJson}
+                        onChange={(e) => setImportByJson(e.target.checked)}
+                        className="h-4 w-4 rounded border-gray-300 text-brand-primary focus:ring-brand-cta"
+                      />
+                      <span className="text-sm font-semibold text-brand-text">JSON 文件导入</span>
+                    </label>
+                  </div>
+                  {importByJson && (
+                    <div className="p-4 rounded-2xl border border-gray-200 bg-gray-50/40">
+                      <div className="flex items-center justify-between gap-4">
+                        <label className="flex items-center justify-center px-4 py-2.5 bg-white border border-gray-200 border-dashed rounded-xl cursor-pointer hover:bg-brand-primary/5 hover:border-brand-primary/50 transition-all duration-300">
+                          <span className="text-sm font-medium text-gray-700">选择 JSON 文件（可多选）</span>
+                      <input
+                            type="file"
+                            accept=".json,application/json"
+                            className="sr-only"
+                            multiple
+                            onChange={async (e: any) => {
+                              try {
+                                const files: File[] = Array.from(e?.target?.files || []);
+                                setJsonImportFiles(files);
+                                if (!files.length) {
+                                  setJsonImportPreview(null);
+                                  return;
+                                }
+                            try {
+                              const handle = (files[0] as any)?.webkitRelativePath || '';
+                              const base = handle ? (handle.split('/')[0] || '') : '';
+                              if (base) localStorage.setItem('AI_DCP_LAST_JSON_BASE', base);
+                              localStorage.setItem('AI_DCP_LAST_JSON_COUNT', String(files.length));
+                              setLastJsonMeta({ base, count: files.length });
+                            } catch (_) {}
+                                setJsonImportPreview({ fileCount: files.length, itemCount: files.length });
+                              } catch (_) {
+                                setJsonImportFiles([]);
+                                setJsonImportPreview(null);
+                              }
+                            }}
+                          />
+                        </label>
+                        <div className="text-xs text-gray-600">
+                          {jsonImportFiles.length ? (
+                            <span className="font-medium text-gray-800">已选择 {jsonImportFiles.length} 个文件</span>
+                          ) : (
+                            <span>未选择文件</span>
+                          )}
+                        </div>
+                      </div>
+                      {!jsonImportFiles.length && lastJsonMeta && (
+                        <div className="mt-2 text-[11px] text-gray-500">
+                          上次选择：{lastJsonMeta.count ? `${lastJsonMeta.count} 个文件` : '未知数量'}
+                          {lastJsonMeta.base ? `（目录：${lastJsonMeta.base}）` : ''}
+                        </div>
+                      )}
+                      {jsonImportPreview ? (
+                        <div className="mt-3 text-xs text-gray-600">
+                          解析预览：JSON 文件 {jsonImportPreview.fileCount} 个，任务 {jsonImportPreview.itemCount} 条（每个文件=1条）
+                        </div>
+                      ) : null}
+                      <div className="mt-2 text-[11px] text-gray-500 leading-relaxed">
+                        规则：每个 JSON 文件视为 1 条任务，JSON 内容会作为“页面内容”与 skill 一起交给 LLM 分析；如果 JSON 内包含 url 字段，会用于生成该条任务的 URL。
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <Input
+                  isTextarea
+                  label="任务列表 (批量)"
+                  rows={8}
+                  value={batchInput}
+                  onChange={(e: any) => setBatchInput(e.target.value)}
+                  className="font-mono text-sm whitespace-pre resize-none"
+                  placeholder={`每行输入一个目标 URL，不包含其他任何元数据信息：\nhttps://oa.ksyun.com/workflow/req?requestid=1\nhttps://oa.ksyun.com/workflow/req?requestid=2`}
+                  required={importByUrl}
+                />
+                
+                <div className="space-y-1.5">
+                  <label className="block text-sm font-semibold text-[#2D3436]">
+                    技能文件 / 文件夹
+                  </label>
+                  <div className="grid grid-cols-2 gap-3">
+                    <label className="flex items-center justify-center w-full px-4 py-3 bg-gray-50/50 border border-gray-200 border-dashed rounded-xl cursor-pointer hover:bg-brand-primary/5 hover:border-brand-primary/50 transition-all duration-300 focus-within:ring-2 focus-within:ring-brand-primary">
+                      <FolderOpen className="w-5 h-5 mr-2 text-gray-500" />
+                      <span className="text-sm font-medium text-gray-600">
+                        选择技能文件夹
+                      </span>
+                      <input
+                        type="file"
+                        // @ts-ignore: webkitdirectory is a non-standard attribute but widely supported
+                        webkitdirectory=""
+                        directory=""
+                        className="sr-only"
+                        onChange={handleFolderSelect}
+                      />
+                    </label>
+                    <label className="flex items-center justify-center w-full px-4 py-3 bg-gray-50/50 border border-gray-200 border-dashed rounded-xl cursor-pointer hover:bg-brand-primary/5 hover:border-brand-primary/50 transition-all duration-300 focus-within:ring-2 focus-within:ring-brand-primary">
+                      <FolderOpen className="w-5 h-5 mr-2 text-gray-500" />
+                      <span className="text-sm font-medium text-gray-600">
+                        选择 skill.md
+                      </span>
+                      <input
+                        type="file"
+                        accept=".md,.markdown,.yaml,.yml"
+                        className="sr-only"
+                        onChange={handleSkillFileSelect}
+                      />
+                    </label>
+                  </div>
+                  {customSkills.length > 0 && (
+                    <p className="mt-1 text-xs text-brand-secondary font-medium animate-in fade-in">
+                      已加载 {customSkills.length} 个技能。建议选择一个技能用于本次批量任务
+                    </p>
+                  )}
+                  {!customSkills.length && (
+                    <p className="mt-1 text-xs text-gray-500">
+                      你上次选择的技能：{(() => {
+                        try {
+                          return localStorage.getItem('AI_DCP_LAST_SKILL_NAME') || '暂无';
+                        } catch (_) {
+                          return '暂无';
+                        }
+                      })()}
+                    </p>
+                  )}
+                  {customSkills.length > 1 && (
+                    <div className="mt-3">
+                      <label className="block text-sm font-semibold text-[#2D3436] mb-1">本次使用的技能</label>
+                      <select
+                        value={selectedSkillName}
+                        onChange={(e) => setSelectedSkillName(e.target.value)}
+                        className="w-full px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50/50 text-[#2D3436] focus:bg-white focus:border-[#E8B4B8] focus:ring-4 focus:ring-[#E8B4B8]/20 outline-none"
+                      >
+                        <option value="" disabled>请选择一个技能</option>
+                      {customSkills.map(s => (
+                        <option key={s.name} value={s.name}>{s.name}</option>
+                      ))}
+                      </select>
+                    </div>
+                  )}
+                {!!customSkills.length && (
+                  <div className="mt-2 text-[11px] text-gray-500">
+                    上次选择的技能：{(() => {
+                      try {
+                        return localStorage.getItem('AI_DCP_LAST_SKILL_NAME') || '暂无';
+                      } catch (_) {
+                        return '暂无';
+                      }
+                    })()}
+                  </div>
+                )}
+                </div>
+
+                <div className="space-y-3">
+                  <label className="flex items-center gap-3 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={drillEnabled}
+                      onChange={(e) => setDrillEnabled(e.target.checked)}
+                      className="h-4 w-4 rounded border-gray-300 text-brand-primary focus:ring-brand-cta"
+                    />
+                    <span className="text-sm font-semibold text-brand-text">启用网页下钻</span>
+                  </label>
+                  {drillEnabled && (
+                    <div className="p-4 rounded-2xl border border-brand-primary/20 bg-white/60 shadow-soft space-y-4 animate-in fade-in">
+                      <div className="text-xs text-gray-600 leading-relaxed">
+                        下钻会自动跟随页面里的链接逐层打开并抓取内容，用于补全信息。你只需要填“下钻层数”，其它参数系统会自动处理。
+                      </div>
+                      <Input
+                        label="下钻层数"
+                        type="number"
+                        min={1}
+                        value={drillDepth}
+                        onChange={(e: any) => setDrillDepth(Number(e.target.value))}
+                        helperText="建议 3（更深会更慢）；你填多少就按多少执行"
+                      />
+                    </div>
+                  )}
+                </div>
+
+                <div className="space-y-3">
+                  <Input
+                    label="JSON 并发数"
+                    type="number"
+                    min={1}
+                    value={jsonConcurrency}
+                    onChange={(e: any) => setJsonConcurrency(Number(e.target.value))}
+                    helperText="仅对 JSON 导入生效；建议 4-16。会同时受 RPM/TPM 限流影响"
+                  />
+                </div>
+
+                <div className="pt-6 border-t border-gray-100 space-y-3">
+                  <Button
+                    type="submit"
+                    variant="cta"
+                    isLoading={loading}
+                    className="w-full text-base py-3"
+                  >
+                    一键批量处理
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    disabled={loading}
+                    className="w-full text-base py-3"
+                    onClick={handleAddToAB}
+                  >
+                    一键加入 AB 评审
+                  </Button>
+                </div>
+              </form>
+            </Card>
+
+            <Card className="lg:col-span-7 min-h-[600px] flex flex-col bg-white/50">
+              <h2 className="text-2xl font-serif font-bold mb-8">批处理状态与报告</h2>
+              
+              {error && (
+                <div className="bg-red-50 text-red-600 p-4 rounded-xl mb-6 flex items-start gap-3 border border-red-100 animate-in slide-in-from-top-2">
+                  <AlertCircle className="w-5 h-5 shrink-0 mt-0.5" />
+                  <p className="text-sm font-medium leading-relaxed">{error}</p>
+                </div>
+              )}
+
+              {loading && (
+                <div className="flex-1 flex items-center justify-center text-gray-400 animate-in fade-in duration-500">
+                  <div className="flex flex-col items-center gap-4">
+                    <div className="relative">
+                      <div className="absolute inset-0 bg-brand-primary/20 rounded-full blur-xl animate-pulse"></div>
+                      <Globe className="w-12 h-12 animate-spin text-brand-primary relative z-10" />
+                    </div>
+                    <p className="font-medium tracking-wide">引擎正在后台逐行提取并思考中...</p>
+                  </div>
+                </div>
+              )}
+
+              {!loading && !result && !error && (
+                <div className="flex-1 flex flex-col items-center justify-center text-gray-400/80 space-y-4">
+                  <div className="p-4 bg-gray-50 rounded-full">
+                    <List className="w-8 h-8 text-gray-300" />
+                  </div>
+                  <p className="font-medium">在此区域显示任务提交状态与 Excel 报告路径</p>
+                </div>
+              )}
+
+              {result && !loading && (
+                <div className="flex-1 flex flex-col animate-in fade-in slide-in-from-bottom-4">
+                  <div className="bg-brand-secondary/10 text-[#2D3436] p-5 rounded-xl mb-6 flex items-start gap-3 border border-brand-secondary/30 shadow-sm">
+                    <CheckCircle className="w-5 h-5 shrink-0 mt-0.5 text-brand-secondary" />
+                    <p className="text-sm font-medium leading-relaxed">{result.message}</p>
+                  </div>
+                  <div className="bg-white p-6 rounded-xl flex-1 border border-gray-100 shadow-soft">
+                    <p className="font-bold font-serif text-lg mb-3">生成报告路径:</p>
+                    <code className="block bg-gray-50 border border-gray-200 px-4 py-3 rounded-lg text-sm text-gray-600 font-mono break-all select-all shadow-inner">
+                      {result.report_path}
+                    </code>
+                    <div className="mt-6 p-4 bg-blue-50/50 rounded-lg border border-blue-100/50">
+                      <p className="text-gray-500 text-sm leading-relaxed">
+                        注：此操作将在后台异步执行。您可以打开上述 Excel 文件实时查看写入进度。断点续跑已自动开启。
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </Card>
+          </div>
+        )}
+
+        {activeTab === 'desktop' && isDesktopApp() && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 transform transition-all duration-500 animate-in fade-in slide-in-from-bottom-4">
+            <Card className="lg:col-span-5 h-fit sticky top-28">
+              <h2 className="text-2xl font-serif font-bold mb-8">后端控制面板</h2>
+              <div className="space-y-4">
+                <div className="p-4 rounded-2xl border border-gray-100 bg-white">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-sm font-semibold text-brand-text">服务状态</div>
+                    <div className="text-xs text-gray-600">{backendStatus?.state || 'unknown'}</div>
+                  </div>
+                  <div className="mt-2 text-xs text-gray-500 break-all">API_BASE: {backendStatus?.apiBase || API_BASE}</div>
+                  <div className="mt-1 text-xs text-gray-500">PID: {backendStatus?.pid ?? '-'}</div>
+                  {backendStatus?.lastError && (
+                    <div className="mt-2 text-xs text-red-600 break-all">错误: {backendStatus.lastError}</div>
+                  )}
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <Button type="button" variant="primary" onClick={handleBackendToggle} isLoading={backendLoading}>
+                    {backendRunning ? '停止' : '启动'}
+                  </Button>
+                  <Button type="button" variant="secondary" onClick={handleBackendRestart} isLoading={backendLoading}>
+                    重启
+                  </Button>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <Button type="button" variant="cta" onClick={() => handleBackendAuth(false)} isLoading={backendLoading}>
+                    授权登录
+                  </Button>
+                  <Button type="button" variant="ghost" onClick={() => handleBackendAuth(true)} isLoading={backendLoading}>
+                    重新授权
+                  </Button>
+                </div>
+                <Button type="button" variant="ghost" onClick={handleOpenWebView}>
+                  内置浏览器（仅浏览）
+                </Button>
+                <div className="p-4 rounded-2xl border border-gray-100 bg-white">
+                  <div className="text-sm font-semibold text-brand-text">资源占用</div>
+                  <div className="mt-2 text-xs text-gray-600">CPU: {metrics?.cpu == null ? '-' : `${metrics.cpu.toFixed(1)}%`}</div>
+                  <div className="mt-1 text-xs text-gray-600">内存: {metrics?.memoryMB == null ? '-' : `${metrics.memoryMB.toFixed(1)} MB`}</div>
+                </div>
+              </div>
+            </Card>
+
+            <Card className="lg:col-span-7 min-h-[600px] flex flex-col bg-white/50">
+              <h2 className="text-2xl font-serif font-bold mb-8">实时日志</h2>
+              <div className="flex gap-3 items-end mb-4">
+                <div className="w-40">
+                  <label className="block text-sm font-semibold text-[#2D3436] mb-1">级别</label>
+                  <select
+                    value={logLevel}
+                    onChange={(e) => setLogLevel(e.target.value as any)}
+                    className="w-full px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50/50 text-[#2D3436] focus:bg-white focus:border-[#E8B4B8] focus:ring-4 focus:ring-[#E8B4B8]/20 outline-none"
+                  >
+                    <option value="all">全部</option>
+                    <option value="stdout">stdout</option>
+                    <option value="stderr">stderr</option>
+                  </select>
+                </div>
+                <div className="flex-1">
+                  <Input
+                    label="关键词"
+                    type="text"
+                    value={logKeyword}
+                    onChange={(e: any) => setLogKeyword(e.target.value)}
+                    placeholder="输入关键词过滤日志"
+                  />
+                </div>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={() => setLogs([])}
+                >
+                  清空
+                </Button>
+              </div>
+              <div className="flex-1 overflow-auto bg-white border border-gray-100 rounded-xl p-3 font-mono text-xs text-gray-700">
+                {(logs || [])
+                  .filter((l) => (logLevel === 'all' ? true : l.source === logLevel))
+                  .filter((l) => (logKeyword ? String(l.line).toLowerCase().includes(logKeyword.toLowerCase()) : true))
+                  .slice(-1500)
+                  .map((l, idx) => (
+                    <div key={idx} className="whitespace-pre-wrap break-words">
+                      <span className="text-gray-400">{new Date(l.ts).toLocaleTimeString()} </span>
+                      <span className={l.source === 'stderr' ? 'text-red-600' : 'text-gray-700'}>
+                        [{l.source}] {l.line}
+                      </span>
+                    </div>
+                  ))}
+              </div>
+            </Card>
+          </div>
+        )}
+
+        {activeTab === 'history' && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 transform transition-all duration-500 animate-in fade-in slide-in-from-bottom-4">
+            <Card className="lg:col-span-5 h-fit sticky top-28">
+              <h2 className="text-2xl font-serif font-bold mb-8">任务监控</h2>
+              <div className="space-y-6">
+                <Input
+                  label="搜索"
+                  type="text"
+                  value={historyQuery}
+                  onChange={(e: any) => setHistoryQuery(e.target.value)}
+                  placeholder="按标题或 URL 搜索"
+                />
+                {isDesktopApp() && (
+                  <div className="flex items-center gap-3">
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      isLoading={historyImporting}
+                      onClick={handleDesktopImportHistory}
+                    >
+                      导入历史库(.db)
+                    </Button>
+                    <div className="text-xs text-gray-500 break-all">
+                      支持选择 history.db / drill.db（用于从旧版本迁移到 App）
+                    </div>
+                  </div>
+                )}
+                <div className="space-y-3">
+                  {historyLoading && <p className="text-sm text-gray-500">正在加载任务记录...</p>}
+                  {!historyLoading && historyEvents.length === 0 && <p className="text-sm text-gray-500">暂无任务记录</p>}
+                  {!historyLoading && historyEvents.map((ev) => (
+                    (() => {
+                      const ts = ev.ts ? new Date(ev.ts * 1000).toLocaleString() : '';
+                      const status = ev.status || 'queued';
+                      const statusLabel = status === 'running'
+                        ? '运行中'
+                        : status === 'completed'
+                          ? '已完成'
+                          : status === 'failed'
+                            ? '失败'
+                            : '排队中';
+                      const statusClass = status === 'running'
+                        ? 'bg-brand-cta/15 text-brand-text border border-brand-cta/30'
+                        : status === 'completed'
+                          ? 'bg-brand-secondary/15 text-brand-text border border-brand-secondary/30'
+                          : status === 'failed'
+                            ? 'bg-red-50 text-red-700 border border-red-200'
+                            : 'bg-gray-100 text-gray-600 border border-gray-200';
+                      const showProgress = ev.kind === 'batch' && typeof ev.total === 'number' && ev.total > 0;
+                      const progressText = showProgress ? `${ev.processed || 0}/${ev.total || 0}` : '';
+                      return (
+                    <button
+                      key={ev.id}
+                      type="button"
+                      onClick={() => handleSelectHistory(ev.id)}
+                      className={`w-full text-left p-4 rounded-xl border transition-all duration-300 ${historySelected?.id === ev.id ? 'border-brand-primary bg-brand-primary/5' : 'border-gray-100 bg-white hover:border-brand-primary/40 hover:bg-brand-primary/5'}`}
+                      aria-label={`查看任务记录: ${ev.title}`}
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="text-sm font-semibold text-brand-text truncate">{ev.title}</div>
+                        <div className="text-xs text-gray-500 shrink-0">#{ev.id}</div>
+                      </div>
+                      <div className="mt-1 text-xs text-gray-500 break-all">{formatJsonfileUrlForDisplay(ev.url)}</div>
+                      <div className="mt-2 flex items-center gap-2 flex-wrap">
+                        <span className={`text-xs px-2 py-1 rounded-full ${statusClass}`}>{statusLabel}</span>
+                        {progressText && <span className="text-xs px-2 py-1 rounded-full bg-gray-50 text-gray-600 border border-gray-200">进度 {progressText}</span>}
+                        <span className="text-xs px-2 py-1 rounded-full bg-gray-100 text-gray-600">{ev.kind}</span>
+                        {ev.path && <span className="text-xs px-2 py-1 rounded-full bg-brand-secondary/10 text-brand-text">可打开</span>}
+                      </div>
+                      {ts && <div className="mt-2 text-xs text-gray-400">创建时间 {ts}</div>}
+                    </button>
+                      );
+                    })()
+                  ))}
+                </div>
+              </div>
+            </Card>
+
+            <Card className="lg:col-span-7 min-h-[600px] flex flex-col bg-white/50">
+              <h2 className="text-2xl font-serif font-bold mb-8">详情</h2>
+              {!historySelected && (
+                <div className="flex-1 flex flex-col items-center justify-center text-gray-400/80 space-y-4">
+                  <div className="p-4 bg-gray-50 rounded-full">
+                    <List className="w-8 h-8 text-gray-300" />
+                  </div>
+                  <p className="font-medium">从左侧选择一条任务记录查看详情</p>
+                </div>
+              )}
+              {historySelected && (
+                <div className="flex-1 flex flex-col gap-6 animate-in fade-in">
+                  <div className="bg-white p-5 rounded-xl border border-gray-100 shadow-soft">
+                    <div className="flex items-start justify-between gap-4">
+                      <div>
+                        <p className="text-lg font-bold font-serif">{historySelected.title}</p>
+                        <p className="text-xs text-gray-500 break-all mt-1">{formatJsonfileUrlForDisplay(historySelected.url)}</p>
+                      </div>
+                      <div className="flex items-center gap-2 flex-wrap justify-end">
+                        {historySelected?.kind === 'batch' &&
+                        historySelected?.status !== 'running' &&
+                        historySelected?.status !== 'queued' &&
+                        Number(historySelected?.failed || 0) > 0 ? (
+                          <Button type="button" variant="cta" onClick={() => handleRetryFailed(historySelected.id)}>
+                            重试失败项
+                          </Button>
+                        ) : null}
+                        {historySelected.path ? (
+                          <Button type="button" variant="secondary" onClick={() => handleOpenHistoryPath(historySelected.id)}>
+                            打开所在位置
+                          </Button>
+                        ) : null}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="bg-white p-5 rounded-xl border border-gray-100 shadow-soft flex-1 overflow-auto">
+                    <p className="text-sm font-semibold text-gray-700 mb-3">明细</p>
+                    <div className="space-y-3">
+                      {historyItems.length === 0 && <p className="text-sm text-gray-500">该记录暂无明细</p>}
+                      {historyItems.map((it) => (
+                        <div key={it.id} className="p-4 rounded-xl border border-gray-100 bg-gray-50/30">
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="text-sm font-medium text-brand-text break-all">{formatJsonfileUrlForDisplay(it.url)}</div>
+                            <span className="text-xs px-2 py-1 rounded-full bg-gray-100 text-gray-600">{it.status}</span>
+                          </div>
+                          {it.skill && <div className="mt-2 text-xs text-gray-600">技能: {it.skill}</div>}
+                          {it.evidence && <div className="mt-2 text-xs text-gray-600">证据: {it.evidence}</div>}
+                          {it.meta?.drill?.enabled && (
+                            <div className="mt-2 text-xs text-gray-600">
+                              下钻: visited={it.meta.drill.visited}, included={it.meta.drill.included}, failed={it.meta.drill.failed}
+                            </div>
+                          )}
+                          {it.result && (
+                            <div className="mt-3">
+                              <div className="text-xs text-gray-600 mb-2">结果</div>
+                              <PrettyJsonViewer value={it.result} defaultMode="fields" />
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </Card>
+          </div>
+        )}
+
+        {/* 首次授权模态窗 */}
+        {authModal && (
+          <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-50 animate-in fade-in duration-300 p-4">
+            <div className="bg-white p-8 rounded-3xl max-w-md w-full shadow-2xl border border-white/20 transform animate-in zoom-in-95 duration-300">
+              <h3 className="text-2xl font-serif font-bold mb-4 flex items-center gap-2 text-brand-text">
+                <span className="bg-brand-cta/10 p-2 rounded-xl"><Globe className="w-6 h-6 text-brand-cta" /></span>
+                首次运行授权请求
+              </h3>
+              <div className="text-[#2D3436]/80 text-sm mb-8 space-y-4 leading-relaxed">
+                <p>
+                  您是首次运行本系统。系统需要您手动登录一次内部平台，以获取并持久化保存您的访问凭证（Cookie/Storage）。
+                </p>
+                <div className="bg-brand-bg p-4 rounded-xl border border-brand-primary/20">
+                  <p className="font-medium text-brand-text">
+                    操作指南：
+                  </p>
+                  <ul className="list-disc list-inside mt-2 space-y-1 text-xs">
+                    <li>点击下方同意后，系统将弹出一个可视化的浏览器窗口。</li>
+                    <li>请在弹出的窗口中完成登录操作。</li>
+                    <li><strong>登录成功后，请手动关闭该浏览器窗口。</strong></li>
+                  </ul>
+                </div>
+                <p className="text-xs text-gray-500">
+                  系统会将凭证加密保存在本地，后续将自动静默运行，不再弹窗。
+                </p>
+              </div>
+              <div className="flex justify-end gap-3 pt-2">
+                <Button onClick={handleCancelAuth} variant="ghost" className="px-5">
+                  拒绝并退出
+                </Button>
+                {isDesktopApp() ? (
+                  <Button
+                    onClick={() => {
+                      setAuthModal(false);
+                      setActiveTab('desktop');
+                    }}
+                    variant="cta"
+                    className="px-6 shadow-md hover:shadow-lg"
+                  >
+                    去控制台授权
+                  </Button>
+                ) : (
+                  <Button onClick={handleAuth} variant="cta" className="px-6 shadow-md hover:shadow-lg">
+                    同意并开启浏览器
+                  </Button>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
+
+export default App;

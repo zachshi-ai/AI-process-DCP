@@ -1,0 +1,409 @@
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+from typing import List, Optional, Dict
+from crawler import WebCrawler
+from config_manager import ConfigManager
+from secret_store import SecretStore
+from llm_processor import LLMProcessor
+from plugin_manager import PluginManager
+from batch_processor import BatchProcessor
+from logger_setup import global_logger as logger
+import os
+import time
+from fastapi.middleware.cors import CORSMiddleware
+from urllib.parse import urlparse
+from history_store import HistoryStore
+from drill_store import DrillStore
+from path_opener import open_in_file_manager, PathOpenError
+
+app = FastAPI(title="AI-DCP Backend")
+
+# 允许跨域请求
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 基础目录及配置管理实例
+BASE_DIR = os.environ.get("AI_DCP_BASE_DIR") or os.path.dirname(__file__)
+USER_DATA_DIR = os.environ.get("AI_DCP_USER_DATA_DIR") or os.path.join(BASE_DIR, "data")
+
+CONFIG_DIR = os.path.join(BASE_DIR, "config")
+PLUGIN_DIR = os.path.join(BASE_DIR, "plugins")
+DATA_DIR = os.path.join(USER_DATA_DIR, "data")
+OUTPUT_DIR = os.path.join(USER_DATA_DIR, "output")
+LOG_DIR = os.path.join(USER_DATA_DIR, "logs")
+
+os.makedirs(os.path.join(CONFIG_DIR, "skill"), exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+config_manager = ConfigManager(CONFIG_DIR)
+secret_store = SecretStore(
+    key_path=os.path.join(USER_DATA_DIR, "secret.key"),
+    store_path=os.path.join(USER_DATA_DIR, "llm_config.enc"),
+)
+plugin_manager = PluginManager(PLUGIN_DIR)
+
+history_store = HistoryStore(os.path.join(DATA_DIR, "history.db"))
+drill_store = DrillStore(os.path.join(DATA_DIR, "drill.db"))
+
+# 初始化一些示例配置
+agent_md_path = os.path.join(CONFIG_DIR, "Agent.md")
+if not os.path.exists(agent_md_path):
+    with open(agent_md_path, "w", encoding="utf-8") as f:
+        f.write("# Agent Role\n你是一个强大的 AI 知识提取与分析助手。请根据抓取的内容进行总结分析。")
+
+
+class LLMConfig(BaseModel):
+    api_token: str
+    base_url: str
+    model: str
+    timeout: int = 60
+    retry: int = 3
+
+
+class CrawlRequest(BaseModel):
+    url: str
+    max_depth: int = 3
+    headless: bool = True
+    skill_name: Optional[str] = "summary"
+    custom_skill_content: Optional[str] = None
+
+
+class BatchRequest(BaseModel):
+    urls: List[str]
+    custom_skills: Optional[Dict[str, str]] = None
+    drill_config: Optional[Dict[str, object]] = None
+    skill_name: Optional[str] = None
+
+
+class HistoryOpenRequest(BaseModel):
+    event_id: int
+
+
+class DrillStartRequest(BaseModel):
+    url: str
+    max_depth: int = 5
+
+
+class DrillNavigateRequest(BaseModel):
+    session_id: str
+    url: str
+
+
+class DrillBackRequest(BaseModel):
+    session_id: str
+
+
+@app.get("/")
+def read_root():
+    return {"status": "ok", "message": "AI-DCP Backend is running!"}
+
+
+@app.post("/api/llm/config")
+def save_llm_config(config: LLMConfig):
+    """
+    保存 LLM 连接配置信息到本地加密存储
+    """
+    existing = secret_store.load_config()
+    merged = dict(existing)
+    merged.update(config.dict())
+    secret_store.save_config(merged)
+    return {"status": "success", "message": "配置保存成功"}
+
+
+@app.get("/api/llm/config")
+def get_llm_config():
+    """
+    获取当前解密后的 LLM 连接配置信息（不包含真实 token）
+    """
+    config = secret_store.load_config()
+    if "api_token" in config:
+        config["api_token"] = "********"  # 返回打码后的结果保证安全
+    return config
+
+
+@app.get("/api/skills")
+def get_skills():
+    """
+    获取所有可用的技能模板列表
+    """
+    skills = config_manager.list_skills()
+    return {"skills": skills}
+
+
+@app.post("/api/auth/start")
+async def start_auth():
+    """
+    首次运行，启动可见浏览器让用户登录
+    """
+    if secret_store.get_auth_status():
+        return {"status": "success", "message": "已经授权过，无需再次授权"}
+
+    try:
+        # 打开一个无意义但能调起浏览器的起始页
+        crawler = WebCrawler(start_url="https://oa.ksyun.com/spa/", max_depth=1, headless=False)
+        await crawler.run()
+        # 一旦浏览器关闭，意味着授权完成，记录状态
+        secret_store.set_auth_status(True)
+        return {"status": "success", "message": "授权状态已永久保存"}
+    except Exception as e:
+        logger.error(f"授权过程出错: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/task/batch")
+async def process_batch_tasks(req: BatchRequest, background_tasks: BackgroundTasks):
+    """
+    批量执行任务 API，检查是否授权，启动后台批处理任务
+    """
+    if not secret_store.get_auth_status():
+        raise HTTPException(status_code=401, detail="首次运行请先完成浏览器授权")
+
+    llm_config = secret_store.load_config()
+    if not llm_config:
+        raise HTTPException(status_code=400, detail="LLM 配置未初始化，请先在设置中配置 API")
+
+    llm_processor = LLMProcessor(
+        api_token=llm_config.get("api_token", ""),
+        base_url=llm_config.get("base_url", ""),
+        model=llm_config.get("model", ""),
+        timeout=llm_config.get("timeout", 60),
+        retry=llm_config.get("retry", 3)
+    )
+
+    event_id = history_store.create_event(
+        kind="batch",
+        title="批量任务",
+        url=req.urls[0] if req.urls else "",
+        path=None,
+        meta={"count": len(req.urls)},
+    )
+    history_store.update_event(
+        event_id,
+        status="queued",
+        total=len(req.urls),
+        processed=0,
+        success=0,
+        failed=0,
+        updated_ts=int(time.time()),
+    )
+    processor = BatchProcessor(
+        config_manager,
+        llm_processor,
+        output_dir=OUTPUT_DIR,
+        history_store=history_store,
+        event_id=event_id,
+        drill_config=req.drill_config,
+        skill_name=req.skill_name,
+    )
+
+    # 将批处理任务放入后台运行，以防请求超时
+    background_tasks.add_task(processor.process_batch, req.urls, req.custom_skills)
+
+    return {
+        "status": "success",
+        "message": f"已将 {len(req.urls)} 个任务加入后台队列，结果将实时写入 {processor.excel_path}",
+        "report_path": processor.excel_path
+    }
+
+
+@app.get("/api/history/events")
+def list_history_events(q: Optional[str] = None, kind: Optional[str] = None, limit: int = 50, offset: int = 0):
+    events = history_store.list_events(q=q, kind=kind, limit=limit, offset=offset)
+    return {
+        "events": [
+            {
+                "id": e.id,
+                "ts": e.ts,
+                "kind": e.kind,
+                "title": e.title,
+                "url": e.url,
+                "path": e.path,
+                "status": e.status,
+                "updated_ts": e.updated_ts,
+                "started_ts": e.started_ts,
+                "finished_ts": e.finished_ts,
+                "total": e.total,
+                "processed": e.processed,
+                "success": e.success,
+                "failed": e.failed,
+                "meta": e.meta,
+            }
+            for e in events
+        ]
+    }
+
+
+@app.get("/api/history/events/{event_id}")
+def get_history_event(event_id: int):
+    event = history_store.get_event(event_id)
+    if not event:
+        raise HTTPException(status_code=404, detail="未找到历史记录")
+    items = history_store.list_items(event_id)
+    return {
+        "event": {
+            "id": event.id,
+            "ts": event.ts,
+            "kind": event.kind,
+            "title": event.title,
+            "url": event.url,
+            "path": event.path,
+            "status": event.status,
+            "updated_ts": event.updated_ts,
+            "started_ts": event.started_ts,
+            "finished_ts": event.finished_ts,
+            "total": event.total,
+            "processed": event.processed,
+            "success": event.success,
+            "failed": event.failed,
+            "meta": event.meta,
+        },
+        "items": [
+            {
+                "id": i.id,
+                "ts": i.ts,
+                "url": i.url,
+                "skill": i.skill,
+                "evidence": i.evidence,
+                "result": i.result,
+                "status": i.status,
+                "meta": i.meta,
+            }
+            for i in items
+        ],
+    }
+
+
+@app.post("/api/history/open")
+def open_history_path(req: HistoryOpenRequest):
+    event = history_store.get_event(req.event_id)
+    if not event or not event.path:
+        raise HTTPException(status_code=404, detail="该记录没有可打开的路径")
+    try:
+        open_in_file_manager(event.path, [OUTPUT_DIR, LOG_DIR, os.path.join(os.path.dirname(__file__), "docs")])
+    except PathOpenError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "success"}
+
+
+@app.post("/api/drill/start")
+async def drill_start(req: DrillStartRequest):
+    parsed = urlparse(req.url)
+    if parsed.scheme not in ["http", "https"]:
+        raise HTTPException(status_code=400, detail="URL 格式不正确")
+    if parsed.netloc.endswith("oa.ksyun.com") and not secret_store.get_auth_status():
+        raise HTTPException(status_code=401, detail="首次运行请先完成浏览器授权")
+    max_depth = max(1, min(int(req.max_depth), 5))
+    event_id = history_store.create_event(
+        kind="drill",
+        title="网页下钻",
+        url=req.url,
+        meta={"max_depth": max_depth},
+    )
+    session_id = drill_store.create_session(max_depth=max_depth, event_id=event_id)
+    crawler = WebCrawler(start_url=req.url, max_depth=max_depth, headless=True)
+    page_data = await crawler.get_page_snapshot(req.url)
+    stack = [page_data]
+    drill_store.save_stack(session_id, stack)
+    history_store.add_item(event_id, req.url, "", "打开页面", page_data.get("title", ""), "visited")
+    return {"session_id": session_id, "max_depth": max_depth, "stack": stack}
+
+
+@app.post("/api/drill/navigate")
+async def drill_navigate(req: DrillNavigateRequest):
+    session = drill_store.get_session(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    if len(session.stack) >= session.max_depth:
+        raise HTTPException(status_code=400, detail="已达到最大下钻深度")
+    crawler = WebCrawler(start_url=req.url, max_depth=session.max_depth, headless=True)
+    page_data = await crawler.get_page_snapshot(req.url)
+    stack = list(session.stack) + [page_data]
+    drill_store.save_stack(req.session_id, stack)
+    history_store.add_item(session.event_id, req.url, "", "导航进入", page_data.get("title", ""), "visited")
+    return {"session_id": req.session_id, "max_depth": session.max_depth, "stack": stack}
+
+
+@app.post("/api/drill/back")
+def drill_back(req: DrillBackRequest):
+    session = drill_store.get_session(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    if len(session.stack) <= 1:
+        return {"session_id": req.session_id, "max_depth": session.max_depth, "stack": session.stack}
+    stack = list(session.stack[:-1])
+    drill_store.save_stack(req.session_id, stack)
+    return {"session_id": req.session_id, "max_depth": session.max_depth, "stack": stack}
+
+
+@app.get("/api/drill/session/{session_id}")
+def drill_get_session(session_id: str):
+    session = drill_store.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return {"session_id": session_id, "max_depth": session.max_depth, "stack": session.stack}
+
+
+@app.post("/api/task/process")
+async def process_task(req: CrawlRequest):
+    """
+    核心业务流程：接收 URL -> 爬取网页内容 -> 读取本地配置 -> 拼装 Prompt -> 调用 LLM -> 返回结果
+    """
+    # 1. 初始化爬虫并抓取网页
+    crawler = WebCrawler(
+        start_url=req.url,
+        max_depth=req.max_depth,
+        headless=req.headless
+    )
+    try:
+        results = await crawler.run()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"网页抓取失败: {str(e)}")
+
+    if not results:
+        raise HTTPException(status_code=404, detail="未抓取到有效内容")
+
+    # 提取所有抓取内容的文本部分合并
+    combined_content = "\n\n".join([item["content"] for item in results])
+
+    # 2. 读取本地配置拼装最终 Prompt
+    try:
+        # 执行插件：在组装 Prompt 前允许插件修改或清洗抓取的内容
+        plugin_context = {"content": combined_content, "url": req.url}
+        processed_context = plugin_manager.execute_plugins(plugin_context)
+        final_prompt = config_manager.build_final_prompt(
+            req.skill_name,
+            processed_context.get("content", combined_content),
+            req.custom_skill_content
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=400, detail=f"配置读取失败: {str(e)}")
+
+    # 3. 调用 LLM 服务进行智能处理
+    llm_config = secret_store.load_config()
+    if not llm_config:
+        raise HTTPException(status_code=400, detail="LLM 配置未初始化，请先在设置中配置 API")
+
+    llm_processor = LLMProcessor(**llm_config)
+
+    try:
+        llm_result = llm_processor.generate(final_prompt)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM 推理失败: {str(e)}")
+
+    return {
+        "status": "success",
+        "crawled_pages": len(results),
+        "result": llm_result
+    }
+
+# 确保在模块被直接运行时启动服务器
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

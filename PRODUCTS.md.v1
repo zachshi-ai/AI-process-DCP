@@ -1,0 +1,20 @@
+# 成品入口（仅保留 2 个版本）
+
+本仓库已将“客户端”和“HTML Web 静态页”拆分到 `products/` 下，旧版 macOS / Windows 发布物已清理。
+
+## 1) HTML Web 版本（静态页面）
+
+目录：`products/html-web/`
+
+- 入口页面：`products/html-web/index.html`
+- 推荐启动（macOS）：双击 `products/html-web/start-macos.command`
+- 后端地址：页面内「LLM配置」里设置 API_BASE（默认通常是 `http://127.0.0.1:8000`）
+
+## 2) macOS 客户端版本（Electron App）
+
+目录：`products/macos-client/`
+
+- 安装包（优先）：`AI-DCP-0.1.8-arm64.dmg`
+- 压缩包（备用）：`AI-DCP-0.1.8-arm64-mac.zip`
+- App 目录（内部产物）：`mac-arm64/AI-DCP.app`
+

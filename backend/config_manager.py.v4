@@ -1,0 +1,189 @@
+import os
+import re
+import datetime
+import yaml
+import json
+
+
+class ConfigManager:
+    """
+    本地配置管理系统，用于解析 Agent.md 和各类 skill 配置文件。
+    支持简单的变量替换（如 {{ variable }}）。
+    """
+
+    def __init__(self, config_dir: str):
+        self.config_dir = config_dir
+        self.agent_path = os.path.join(self.config_dir, "Agent.md")
+        self.skills_dir = os.path.join(self.config_dir, "skill")
+
+    def read_agent_config(self) -> str:
+        """
+        读取核心的 Agent.md 配置文件。
+        """
+        if not os.path.exists(self.agent_path):
+            raise FileNotFoundError(f"未找到核心配置文件: {self.agent_path}")
+
+        with open(self.agent_path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def list_skills(self) -> list:
+        """
+        获取当前 skill 目录下的所有技能模板名称。
+        """
+        skills = []
+        if not os.path.exists(self.skills_dir):
+            return skills
+        for filename in os.listdir(self.skills_dir):
+            if filename.endswith((".yaml", ".yml", ".md")):
+                skills.append(filename.rsplit(".", 1)[0])
+        return sorted(skills)
+
+    def match_skill(self, url: str, custom_skills: dict = None) -> tuple:
+        """
+        基于 URL 字符串包含关系（禁止正则）进行技能匹配。
+        1) 遍历所有 YAML 配置的 url_keyword 或 match_url 字段。
+        2) 检查其是否为当前目标 url 的子串。
+        3) 最终返回 (匹配到的技能名称, [候选项列表])
+        """
+        skills = {}
+        if custom_skills:
+            skills = dict(custom_skills)
+        else:
+            skills = {name: self.get_skill_template(name) for name in self.list_skills()}
+
+        matched_keys = []
+        for name, content in skills.items():
+            data = content
+            if isinstance(content, str):
+                try:
+                    parsed = yaml.safe_load(content)
+                except BaseException:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    data = parsed
+            if not isinstance(data, dict):
+                continue
+
+            # 禁止使用正则，仅通过简单的字符串包含（子串）来匹配
+            url_keyword = data.get("url_keyword") or data.get("match_url")
+            if url_keyword and str(url_keyword) in url:
+                matched_keys.append(name)
+
+        if len(matched_keys) == 1:
+            return matched_keys[0], []
+        elif len(matched_keys) > 1:
+            return None, matched_keys
+        else:
+            return None, list(skills.keys())
+
+    def get_skill_template(self, skill_name: str):
+        """
+        读取指定的技能模板内容。
+        - .yaml/.yml: 返回 dict
+        - .md: 返回 str
+        """
+        for ext in [".yaml", ".yml"]:
+            skill_path = os.path.join(self.skills_dir, f"{skill_name}{ext}")
+            if os.path.exists(skill_path):
+                with open(skill_path, "r", encoding="utf-8") as f:
+                    return yaml.safe_load(f) or {}
+        md_path = os.path.join(self.skills_dir, f"{skill_name}.md")
+        if os.path.exists(md_path):
+            with open(md_path, "r", encoding="utf-8") as f:
+                return f.read()
+        raise FileNotFoundError(f"未找到指定的技能配置文件: {skill_name}")
+
+    def render_prompt(self, template: str, variables: dict) -> str:
+        """
+        替换模板中的变量，支持简单的 {{ key }} 格式替换。
+        可以用于组合 Agent 设定、Skill 模板和抓取的网页内容。
+        """
+        result = template
+        for key, value in variables.items():
+            # 使用正则替换所有的 {{ key }}，忽略两边空格
+            pattern = r"\{\{\s*" + re.escape(key) + r"\s*\}\}"
+            result = re.sub(pattern, str(value), result)
+
+        return result
+
+    def build_final_prompt(self, skill_name: str, scraped_content: str, custom_skill_content: str = None) -> str:
+        """
+        构建最终发送给 LLM 的完整 Prompt。
+        如果传入了 custom_skill_content，则优先使用该内容作为技能模板；
+        否则从本地 skill 目录下读取对应的 skill_name.md。
+        拼接逻辑： Agent 设定 + 选定的 Skill 模板 + 抓取的网页内容。
+        """
+        skill_raw = custom_skill_content if custom_skill_content is not None else self.get_skill_template(skill_name)
+
+        skill_data = None
+        if isinstance(skill_raw, dict):
+            skill_data = skill_raw
+        elif custom_skill_content is not None and isinstance(skill_raw, str):
+            s = skill_raw.strip()
+            parsed = None
+            if s.startswith("{") and s.endswith("}"):
+                try:
+                    parsed = json.loads(s)
+                except Exception:
+                    parsed = None
+            if parsed is None:
+                first_line = (s.splitlines()[0] if s else "").strip()
+                maybe_yaml = bool(re.match(r"^[A-Za-z0-9_\-]+\s*:", first_line))
+                looks_like_markdown = bool(re.match(r"^\s*#{1,6}\s+", first_line))
+                if s.startswith("---") or (maybe_yaml and not looks_like_markdown):
+                    try:
+                        parsed = yaml.safe_load(s)
+                    except BaseException:
+                        parsed = None
+            if isinstance(parsed, dict):
+                skill_data = parsed
+
+        if custom_skill_content is not None:
+            if isinstance(skill_data, dict):
+                skill_definition = {k: v for k, v in skill_data.items() if k not in ["url_keyword", "match_url"]}
+                skill_text = yaml.dump(skill_definition, allow_unicode=True).strip()
+            else:
+                skill_text = str(skill_raw or "").strip()
+
+            if re.search(r"\{\{\s*content\s*\}\}", skill_text):
+                final_prompt = self.render_prompt(skill_text, {"content": scraped_content})
+            else:
+                if skill_text:
+                    final_prompt = f"{skill_text}\n\n{scraped_content or ''}".strip()
+                else:
+                    final_prompt = str(scraped_content or "").strip()
+            return final_prompt
+
+        if isinstance(skill_data, dict):
+            skill_definition = {k: v for k, v in skill_data.items() if k not in ["url_keyword", "match_url"]}
+            yaml_desc = yaml.dump(skill_definition, allow_unicode=True)
+            skill_block = f"=== Skill 定义 (YAML) ===\n{yaml_desc}\n\n"
+        else:
+            skill_text = str(skill_raw or "").strip()
+            skill_block = f"=== Skill 模板 (Markdown/文本) ===\n{skill_text}\n\n"
+
+        if custom_skill_content is None:
+            agent_config = self.read_agent_config()
+            now = datetime.datetime.now().astimezone()
+            now_iso = now.isoformat()
+            today = now.date().isoformat()
+            combined_template = (
+                f"{agent_config}\n\n"
+                f"=== 系统时间 (用于日期对比) ===\n"
+                f"now: {now_iso}\n"
+                f"today: {today}\n\n"
+                f"{skill_block}"
+                f"=== 抓取内容 ===\n{{{{ content }}}}\n\n"
+            )
+            combined_template += (
+                "请严格按照 JSON 格式输出，包含以下两个字段：\n"
+                "1. \"evidence\": 必须写明得出“处理结果”所依据的页面元素、接口返回值、状态码、关键字命中条数、正则匹配细节或决策树判断路径，确保证据可追溯、条件可复现，字数控制在 1200 字以内（可用环境变量 AI_DCP_EVIDENCE_LIMIT 调整后端截断上限）。\n"
+                "2. \"result\": 处理结果。\n"
+            )
+            combined_template += "如果前文（含 Skill 模板）要求输出 Markdown/表格/段落等格式，请全部忽略，必须只输出 JSON。\n"
+
+        # 替换变量
+        final_prompt = self.render_prompt(combined_template, {"content": scraped_content})
+
+        return final_prompt
+
