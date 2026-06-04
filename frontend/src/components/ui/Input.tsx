@@ -13,12 +13,12 @@ export const Input = React.forwardRef<any, InputProps>(
     const Component = isTextarea ? 'textarea' : 'input';
     return (
       <div className="space-y-1.5">
-        <label className="block text-sm font-semibold text-[#2D3436]">
+        <label className="block text-sm font-semibold text-brand-text">
           {label}
         </label>
         <Component
           ref={ref}
-          className={`w-full px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50/50 text-[#2D3436] placeholder-gray-400 transition-all duration-300 focus:bg-white focus:border-[#E8B4B8] focus:ring-4 focus:ring-[#E8B4B8]/20 outline-none ${className}`}
+          className={`w-full px-4 py-2.5 rounded-lg border border-gray-200 bg-white text-brand-text placeholder-gray-400 transition-colors duration-200 focus:border-brand-primary focus:ring-4 focus:ring-brand-primary/15 outline-none ${className}`}
           {...(props as any)}
         />
         {helperText && (

@@ -25,6 +25,7 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 from ab_store import ABAuditStore
+from pathlib import Path
 
 app = FastAPI(title="AI-DCP Backend")
 
@@ -255,6 +256,11 @@ class ABRunRequest(BaseModel):
 
 class HistoryOpenRequest(BaseModel):
     event_id: int
+
+
+class HistoryEventUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    note: Optional[str] = None
 
 
 class MBNotesUpdateRequest(BaseModel):
@@ -1218,6 +1224,32 @@ def _mb_build_columns(show_pay_type: bool, extra_fields: Optional[List[MBExtraFi
     return cols
 
 
+def _is_under_any_base(target: Path, bases: List[Path]) -> bool:
+    for base in bases:
+        try:
+            target.relative_to(base)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _safe_delete_path(target_path: str, allowed_base_dirs: List[str]) -> None:
+    p = Path(target_path).expanduser().resolve()
+    bases = [Path(d).expanduser().resolve() for d in allowed_base_dirs]
+    if not _is_under_any_base(p, bases):
+        raise HTTPException(status_code=400, detail="待删除路径不在允许范围内")
+    for b in bases:
+        if p == b:
+            raise HTTPException(status_code=400, detail="不允许删除根目录")
+    if not p.exists():
+        return
+    if p.is_dir():
+        shutil.rmtree(p)
+    else:
+        p.unlink()
+
+
 def _build_mb_table_row(item: object, seq: int, extra_fields: Optional[List[MBExtraField]] = None) -> Dict[str, object]:
     """
     将 history_items 的单条记录，映射为 mb_JSON_test.xlsx 对应的一行数据。
@@ -1370,6 +1402,66 @@ def get_history_event(event_id: int):
             for i in items
         ],
     }
+
+
+@app.put("/api/history/events/{event_id}")
+def update_history_event(event_id: int, req: HistoryEventUpdateRequest):
+    event = history_store.get_event(event_id)
+    if not event:
+        raise HTTPException(status_code=404, detail="未找到历史记录")
+
+    did_update = False
+    if req.title is not None:
+        title = str(req.title or "").strip()
+        if not title:
+            raise HTTPException(status_code=400, detail="标题不能为空")
+        history_store.update_event(event_id, title=title, updated_ts=int(time.time()))
+        did_update = True
+
+    if req.note is not None:
+        history_store.merge_event_meta(event_id, {"note": str(req.note)})
+        did_update = True
+
+    if not did_update:
+        raise HTTPException(status_code=400, detail="未提供可更新字段")
+
+    return {"status": "success"}
+
+
+@app.delete("/api/history/events/{event_id}")
+def delete_history_event(event_id: int, delete_files: bool = True):
+    event = history_store.get_event(event_id)
+    if not event:
+        raise HTTPException(status_code=404, detail="未找到历史记录")
+
+    if delete_files:
+        paths: List[str] = []
+        if event.path:
+            paths.append(str(event.path))
+        meta = event.meta if isinstance(event.meta, dict) else {}
+        for k in ["report_path", "log_path", "input_snapshot_path"]:
+            v = str(meta.get(k) or "").strip()
+            if v:
+                paths.append(v)
+
+        dedup = []
+        seen = set()
+        for p in paths:
+            if p in seen:
+                continue
+            seen.add(p)
+            dedup.append(p)
+
+        try:
+            for p in dedup:
+                _safe_delete_path(p, [OUTPUT_DIR])
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"删除文件失败: {str(e)}")
+
+    history_store.delete_event(event_id)
+    return {"status": "success"}
 
 
 @app.post("/api/history/events/{event_id}/retry_failed")

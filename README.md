@@ -2,14 +2,14 @@
 
 本仓库用于维护 AI-DCP 的“可上传 Git 的干净源码工作区”（不包含运行数据、依赖目录、密钥文件）。
 
-## 快速开始（V14 基线）
+## 快速开始（V15 基线）
 
-V14 对应 Git 标签：`v14`。运行默认使用：
+V15 对应 Git 标签：`v15`。运行默认使用：
 
 - 后端：`http://127.0.0.1:8000/`
 - 前端：`http://127.0.0.1:5175/`
 
-版本说明见：[docs/versions/v14.md](docs/versions/v14.md)
+版本说明见：[docs/versions/v15.md](docs/versions/v15.md)
 
 ## 一键启动（推荐）
 
@@ -58,8 +58,8 @@ npm run dev -- --host 127.0.0.1 --port 5175
 ## 版本维护建议（你后续照着做就行）
 
 - 日常开发：正常 `git add/commit`
-- 发布一个版本：打 tag（例如 `v14`），并新增版本说明文件 `docs/versions/v14.md`
-- 同步快照（双保险）：在 `_versioning/source/AI-DCP-src-v14/` 另存一份源码快照（不包含 `node_modules/dist/venv/.run/data/logs/.env` 等）
+- 发布一个版本：打 tag（例如 `v15`），并新增版本说明文件 `docs/versions/v15.md`
+- 同步快照（双保险）：在 `_versioning/source/AI-DCP-src-v15/` 另存一份源码快照（不包含 `node_modules/dist/venv/.run/data/logs/.env` 等）
 
 详细流程见：[VERSIONING.md](VERSIONING.md)
 

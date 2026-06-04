@@ -86,27 +86,34 @@ export function MbBatchAnalysisPage(props: { apiBase: string }) {
     <>
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 transform transition-all duration-500 animate-in fade-in slide-in-from-bottom-4">
         <Card className="lg:col-span-5 h-fit sticky top-28">
-          <h2 className="text-2xl font-serif font-bold mb-6">人机评测</h2>
+          <h2 className="text-2xl font-semibold mb-6">人机评测</h2>
 
           <div className="space-y-4">
             <Input label="搜索任务记录" type="text" value={query} onChange={(e: any) => setQuery(e.target.value)} placeholder="按标题或 URL 搜索" />
 
-            <div className="flex gap-2 flex-wrap">
-              <Button type="button" variant="secondary" onClick={handleSelectAll} disabled={loading || events.length === 0}>
-                全选
-              </Button>
-              <Button type="button" variant="ghost" onClick={handleClearSelection} disabled={loading || selectedIds.length === 0}>
-                清空选择
-              </Button>
-            </div>
-
-            <div className="flex gap-2 flex-wrap">
-              <Button type="button" variant="cta" onClick={handleImport} disabled={selectedIds.length === 0}>
-                导入选中（{selectedIds.length}）
-              </Button>
-              <Button type="button" variant="ghost" onClick={handleClearImported} disabled={importedIds.length === 0}>
-                清空已导入
-              </Button>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="border border-gray-200/70 bg-gray-50/40 rounded-2xl p-3">
+                <div className="text-xs font-semibold text-gray-600 mb-2">选择</div>
+                <div className="flex gap-2 flex-wrap">
+                  <Button type="button" variant="secondary" onClick={handleSelectAll} disabled={loading || events.length === 0}>
+                    全选
+                  </Button>
+                  <Button type="button" variant="ghost" onClick={handleClearSelection} disabled={loading || selectedIds.length === 0}>
+                    清空选择
+                  </Button>
+                </div>
+              </div>
+              <div className="border border-gray-200/70 bg-gray-50/40 rounded-2xl p-3">
+                <div className="text-xs font-semibold text-gray-600 mb-2">导入</div>
+                <div className="flex gap-2 flex-wrap">
+                  <Button type="button" variant="cta" onClick={handleImport} disabled={selectedIds.length === 0}>
+                    导入选中（{selectedIds.length}）
+                  </Button>
+                  <Button type="button" variant="ghost" onClick={handleClearImported} disabled={importedIds.length === 0}>
+                    清空已导入
+                  </Button>
+                </div>
+              </div>
             </div>
 
             {error ? <div className="text-sm text-red-600">{error}</div> : null}
@@ -137,7 +144,7 @@ export function MbBatchAnalysisPage(props: { apiBase: string }) {
 
         <Card className="lg:col-span-7 min-h-[600px] flex flex-col bg-white/50">
           <div className="flex items-center justify-between gap-3 mb-6">
-            <h2 className="text-2xl font-serif font-bold">测试表</h2>
+            <h2 className="text-2xl font-semibold">测试表</h2>
             {importedIds.length > 0 ? (
               <Button type="button" variant="secondary" onClick={() => setExpanded(true)}>
                 大视图展开
@@ -160,15 +167,9 @@ export function MbBatchAnalysisPage(props: { apiBase: string }) {
             className="w-full h-full bg-white rounded-2xl shadow-soft border border-white/40 backdrop-blur-sm p-4 sm:p-6 flex flex-col"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex items-center justify-between gap-3 mb-4">
-              <div className="text-xl font-serif font-bold">测试表（大视图）</div>
-              <Button type="button" variant="secondary" onClick={() => setExpanded(false)}>
-                关闭
-              </Button>
-            </div>
             <div className="flex-1 min-h-0 overflow-hidden">
               <div className="h-full overflow-auto">
-                <MbJsonTablePage apiBase={apiBase} eventIds={importedIds} wide />
+                <MbJsonTablePage apiBase={apiBase} eventIds={importedIds} wide headerTitle="测试表（大视图）" onClose={() => setExpanded(false)} />
               </div>
             </div>
           </div>

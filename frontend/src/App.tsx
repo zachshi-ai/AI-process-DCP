@@ -116,6 +116,10 @@ function App() {
   const [historySelected, setHistorySelected] = useState<any>(null);
   const [historyItems, setHistoryItems] = useState<any[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyEditOpen, setHistoryEditOpen] = useState(false);
+  const [historyEditTitle, setHistoryEditTitle] = useState('');
+  const [historyEditNote, setHistoryEditNote] = useState('');
+  const [historyEditSaving, setHistoryEditSaving] = useState(false);
   const [drillEnabled, setDrillEnabled] = useState(false);
   const [drillDepth, setDrillDepth] = useState(3);
   const [jsonConcurrency, setJsonConcurrency] = useState<number>(8);
@@ -889,12 +893,62 @@ function App() {
     }
   };
 
+  const openHistoryEdit = () => {
+    if (!historySelected?.id) return;
+    const title = String(historySelected.title || '').trim();
+    const meta = historySelected.meta && typeof historySelected.meta === 'object' ? historySelected.meta : {};
+    const note = String(meta?.note || '').trim();
+    setHistoryEditTitle(title);
+    setHistoryEditNote(note);
+    setHistoryEditOpen(true);
+  };
+
+  const handleSaveHistoryEdit = async () => {
+    const eventId = Number(historySelected?.id || 0);
+    if (!eventId) return;
+    const title = String(historyEditTitle || '').trim();
+    if (!title) {
+      alert('标题不能为空');
+      return;
+    }
+    setHistoryEditSaving(true);
+    try {
+      await axios.put(`${apiBase}/api/history/events/${eventId}`, {
+        title,
+        note: historyEditNote,
+      });
+      setHistoryEditOpen(false);
+      setHistoryReloadKey((k) => k + 1);
+      await handleSelectHistory(eventId);
+    } catch (err: any) {
+      alert(err?.response?.data?.detail || err?.message || '保存失败');
+    } finally {
+      setHistoryEditSaving(false);
+    }
+  };
+
+  const handleDeleteHistory = async () => {
+    const eventId = Number(historySelected?.id || 0);
+    if (!eventId) return;
+    const ok = window.confirm('确认删除这条历史记录吗？该记录的输出文件也会一并删除，无法恢复。');
+    if (!ok) return;
+    try {
+      await axios.delete(`${apiBase}/api/history/events/${eventId}`, { params: { delete_files: true } });
+      setHistoryEvents((prev) => prev.filter((e) => e.id !== eventId));
+      setHistorySelected(null);
+      setHistoryItems([]);
+      setHistoryReloadKey((k) => k + 1);
+    } catch (err: any) {
+      alert(err?.response?.data?.detail || err?.message || '删除失败');
+    }
+  };
+
   return (
     <div className="min-h-screen bg-brand-bg text-brand-text font-sans antialiased selection:bg-brand-primary/30">
       <header className="sticky top-0 z-50 bg-white/80 backdrop-blur-md shadow-sm border-b border-white/20">
         <div className="max-w-5xl mx-auto px-6 py-4">
           <div className="flex items-center justify-between gap-6">
-            <h1 className="text-2xl font-bold font-serif text-brand-text flex items-center gap-3 shrink-0">
+            <h1 className="text-2xl font-semibold text-brand-text flex items-center gap-3 shrink-0">
               <div className="bg-brand-primary p-2 rounded-xl text-white shadow-soft">
                 <TerminalSquare className="w-5 h-5" />
               </div>
@@ -1009,7 +1063,7 @@ function App() {
       <main className="max-w-5xl mx-auto px-6 py-10">
         {activeTab === 'config' && (
           <Card className="max-w-2xl mx-auto transform transition-all duration-500 animate-in fade-in slide-in-from-bottom-4">
-            <h2 className="text-2xl font-serif font-bold mb-8 flex items-center gap-2">大语言模型 (LLM) 配置</h2>
+            <h2 className="text-2xl font-semibold mb-8 flex items-center gap-2">大语言模型 (LLM) 配置</h2>
             <form onSubmit={handleSaveConfig} className="space-y-6">
               {!isDesktopApp() && (
                 <Input
@@ -1087,7 +1141,7 @@ function App() {
         {activeTab === 'results' && (
           <div className="transform transition-all duration-500 animate-in fade-in slide-in-from-bottom-4">
             <div className="flex items-center justify-between gap-4 mb-6 flex-wrap">
-              <h2 className="text-2xl font-serif font-bold">结果呈现</h2>
+              <h2 className="text-2xl font-semibold">结果呈现</h2>
               <div className="flex gap-2 bg-gray-100/50 p-1 rounded-xl border border-gray-200/50">
                 <button
                   type="button"
@@ -1118,7 +1172,7 @@ function App() {
         {activeTab === 'process' && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 transform transition-all duration-500 animate-in fade-in slide-in-from-bottom-4">
             <Card className="lg:col-span-5 h-fit sticky top-28">
-              <h2 className="text-2xl font-serif font-bold mb-8 flex items-center gap-2">
+              <h2 className="text-2xl font-semibold mb-8 flex items-center gap-2">
                 <List className="w-6 h-6 text-brand-primary" /> 任务创建
               </h2>
               <div className="mb-4 text-xs text-gray-500 break-all">后端地址: {normalizeApiBase(apiBase)}</div>
@@ -1352,7 +1406,7 @@ function App() {
             </Card>
 
             <Card className="lg:col-span-7 min-h-[600px] flex flex-col bg-white/50">
-              <h2 className="text-2xl font-serif font-bold mb-8">批处理状态与报告</h2>
+              <h2 className="text-2xl font-semibold mb-8">批处理状态与报告</h2>
               
               {error && (
                 <div className="bg-red-50 text-red-600 p-4 rounded-xl mb-6 flex items-start gap-3 border border-red-100 animate-in slide-in-from-top-2">
@@ -1389,7 +1443,7 @@ function App() {
                     <p className="text-sm font-medium leading-relaxed">{result.message}</p>
                   </div>
                   <div className="bg-white p-6 rounded-xl flex-1 border border-gray-100 shadow-soft">
-                    <p className="font-bold font-serif text-lg mb-3">生成报告路径:</p>
+                    <p className="font-semibold text-lg mb-3">生成报告路径:</p>
                     <code className="block bg-gray-50 border border-gray-200 px-4 py-3 rounded-lg text-sm text-gray-600 font-mono break-all select-all shadow-inner">
                       {result.report_path}
                     </code>
@@ -1408,7 +1462,7 @@ function App() {
         {activeTab === 'desktop' && isDesktopApp() && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 transform transition-all duration-500 animate-in fade-in slide-in-from-bottom-4">
             <Card className="lg:col-span-5 h-fit sticky top-28">
-              <h2 className="text-2xl font-serif font-bold mb-8">后端控制面板</h2>
+              <h2 className="text-2xl font-semibold mb-8">后端控制面板</h2>
               <div className="space-y-4">
                 <div className="p-4 rounded-2xl border border-gray-100 bg-white">
                   <div className="flex items-center justify-between gap-3">
@@ -1449,7 +1503,7 @@ function App() {
             </Card>
 
             <Card className="lg:col-span-7 min-h-[600px] flex flex-col bg-white/50">
-              <h2 className="text-2xl font-serif font-bold mb-8">实时日志</h2>
+              <h2 className="text-2xl font-semibold mb-8">实时日志</h2>
               <div className="flex gap-3 items-end mb-4">
                 <div className="w-40">
                   <label className="block text-sm font-semibold text-[#2D3436] mb-1">级别</label>
@@ -1501,7 +1555,7 @@ function App() {
         {activeTab === 'history' && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 transform transition-all duration-500 animate-in fade-in slide-in-from-bottom-4">
             <Card className="lg:col-span-5 h-fit sticky top-28">
-              <h2 className="text-2xl font-serif font-bold mb-8">任务监控</h2>
+              <h2 className="text-2xl font-semibold mb-8">任务监控</h2>
               <div className="space-y-6">
                 <Input
                   label="搜索"
@@ -1561,6 +1615,11 @@ function App() {
                         <div className="text-xs text-gray-500 shrink-0">#{ev.id}</div>
                       </div>
                       <div className="mt-1 text-xs text-gray-500 break-all">{formatJsonfileUrlForDisplay(ev.url)}</div>
+                      {ev?.meta?.note ? (
+                        <div className="mt-1 text-xs text-gray-600 whitespace-pre-wrap break-words">
+                          {String(ev.meta.note || '')}
+                        </div>
+                      ) : null}
                       <div className="mt-2 flex items-center gap-2 flex-wrap">
                         <span className={`text-xs px-2 py-1 rounded-full ${statusClass}`}>{statusLabel}</span>
                         {progressText && <span className="text-xs px-2 py-1 rounded-full bg-gray-50 text-gray-600 border border-gray-200">进度 {progressText}</span>}
@@ -1577,7 +1636,7 @@ function App() {
             </Card>
 
             <Card className="lg:col-span-7 min-h-[600px] flex flex-col bg-white/50">
-              <h2 className="text-2xl font-serif font-bold mb-8">详情</h2>
+              <h2 className="text-2xl font-semibold mb-8">详情</h2>
               {!historySelected && (
                 <div className="flex-1 flex flex-col items-center justify-center text-gray-400/80 space-y-4">
                   <div className="p-4 bg-gray-50 rounded-full">
@@ -1591,8 +1650,13 @@ function App() {
                   <div className="bg-white p-5 rounded-xl border border-gray-100 shadow-soft">
                     <div className="flex items-start justify-between gap-4">
                       <div>
-                        <p className="text-lg font-bold font-serif">{historySelected.title}</p>
+                        <p className="text-lg font-semibold">{historySelected.title}</p>
                         <p className="text-xs text-gray-500 break-all mt-1">{formatJsonfileUrlForDisplay(historySelected.url)}</p>
+                        {historySelected?.meta?.note ? (
+                          <p className="text-xs text-gray-600 mt-2 whitespace-pre-wrap break-words">
+                            {String(historySelected.meta.note || '')}
+                          </p>
+                        ) : null}
                       </div>
                       <div className="flex items-center gap-2 flex-wrap justify-end">
                         {historySelected?.kind === 'batch' &&
@@ -1608,6 +1672,12 @@ function App() {
                             打开所在位置
                           </Button>
                         ) : null}
+                        <Button type="button" variant="secondary" onClick={openHistoryEdit}>
+                          重命名/备注
+                        </Button>
+                        <Button type="button" variant="ghost" onClick={handleDeleteHistory} className="text-red-600 hover:bg-red-50">
+                          删除
+                        </Button>
                       </div>
                     </div>
                   </div>
@@ -1645,11 +1715,51 @@ function App() {
           </div>
         )}
 
+        {historyEditOpen && (
+          <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-50 animate-in fade-in duration-200 p-4">
+            <div className="bg-white p-7 rounded-3xl max-w-lg w-full shadow-2xl border border-white/20 transform animate-in zoom-in-95 duration-200">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <h3 className="text-xl font-semibold text-brand-text">编辑历史记录</h3>
+                  <div className="mt-1 text-xs text-gray-500">支持重命名与备注，方便你只保留关注的数据。</div>
+                </div>
+                <Button variant="ghost" className="px-3" onClick={() => setHistoryEditOpen(false)}>
+                  关闭
+                </Button>
+              </div>
+              <div className="mt-6 space-y-4">
+                <Input
+                  label="名称"
+                  type="text"
+                  value={historyEditTitle}
+                  onChange={(e: any) => setHistoryEditTitle(e.target.value)}
+                />
+                <Input
+                  label="备注（可选）"
+                  isTextarea
+                  rows={4 as any}
+                  value={historyEditNote}
+                  onChange={(e: any) => setHistoryEditNote(e.target.value)}
+                  placeholder="例如：金山云采购付款申请 / 6月第一轮 / 需要重点关注的样本..."
+                />
+              </div>
+              <div className="mt-6 flex justify-end gap-3">
+                <Button variant="ghost" onClick={() => setHistoryEditOpen(false)} disabled={historyEditSaving}>
+                  取消
+                </Button>
+                <Button variant="primary" onClick={handleSaveHistoryEdit} isLoading={historyEditSaving}>
+                  保存
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* 首次授权模态窗 */}
         {authModal && (
           <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-50 animate-in fade-in duration-300 p-4">
             <div className="bg-white p-8 rounded-3xl max-w-md w-full shadow-2xl border border-white/20 transform animate-in zoom-in-95 duration-300">
-              <h3 className="text-2xl font-serif font-bold mb-4 flex items-center gap-2 text-brand-text">
+              <h3 className="text-2xl font-semibold mb-4 flex items-center gap-2 text-brand-text">
                 <span className="bg-brand-cta/10 p-2 rounded-xl"><Globe className="w-6 h-6 text-brand-cta" /></span>
                 首次运行授权请求
               </h3>

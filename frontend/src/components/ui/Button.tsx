@@ -7,13 +7,14 @@ interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
 
 export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
   ({ className = '', variant = 'primary', isLoading, children, ...props }, ref) => {
-    const baseStyles = "inline-flex items-center justify-center rounded-xl px-6 py-2.5 text-sm font-semibold tracking-wide transition-all duration-300 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed";
+    const baseStyles =
+      "inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition-colors duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-primary/30 focus-visible:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed";
     
     const variants = {
-      primary: "bg-[#E8B4B8] text-[#2D3436] hover:bg-[#DCA1A6] shadow-[0_8px_20px_rgba(232,180,184,0.3)] hover:shadow-[0_12px_25px_rgba(232,180,184,0.4)] hover:-translate-y-0.5",
-      secondary: "bg-[#A8D5BA] text-[#2D3436] hover:bg-[#96C7A9] shadow-[0_8px_20px_rgba(168,213,186,0.3)] hover:shadow-[0_12px_25px_rgba(168,213,186,0.4)] hover:-translate-y-0.5",
-      cta: "bg-[#D4AF37] text-white hover:bg-[#C29F2F] shadow-[0_8px_20px_rgba(212,175,55,0.3)] hover:shadow-[0_12px_25px_rgba(212,175,55,0.4)] hover:-translate-y-0.5",
-      ghost: "bg-transparent text-[#2D3436] hover:bg-black/5"
+      primary: "bg-brand-primary text-white hover:bg-brand-primary/90",
+      secondary: "bg-white text-brand-text border border-gray-200 hover:bg-gray-50",
+      cta: "bg-brand-cta text-white hover:bg-brand-cta/90",
+      ghost: "bg-transparent text-brand-text hover:bg-gray-100"
     };
 
     return (

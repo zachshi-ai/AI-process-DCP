@@ -479,6 +479,12 @@ class HistoryStore:
             )
         return items
 
+    def delete_event(self, event_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM history_items WHERE event_id=?", (event_id,))
+            conn.execute("DELETE FROM history_events WHERE id=?", (event_id,))
+            conn.commit()
+
     def update_item(
         self,
         item_id: int,

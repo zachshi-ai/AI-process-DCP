@@ -1,17 +1,18 @@
 @import "tailwindcss";
 
 @theme {
-  --color-brand-primary: #E8B4B8;
-  --color-brand-secondary: #A8D5BA;
-  --color-brand-cta: #D4AF37;
-  --color-brand-bg: #FFF5F5;
-  --color-brand-text: #2D3436;
+  --color-brand-primary: #3370FF;
+  --color-brand-secondary: #00B96B;
+  --color-brand-cta: #FF7D00;
+  --color-brand-bg: #F7F8FA;
+  --color-brand-text: #1F2329;
 
-  --font-serif: "Cormorant Garamond", ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
-  --font-sans: "Montserrat", ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", "Helvetica Neue", Arial, sans-serif,
+    "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
 
-  --shadow-soft: 0 10px 40px -10px rgba(0,0,0,0.05);
-  --shadow-hover: 0 20px 50px -10px rgba(0,0,0,0.1);
+  --shadow-soft: 0 6px 18px rgba(31, 35, 41, 0.08);
+  --shadow-hover: 0 10px 26px rgba(31, 35, 41, 0.12);
 }
 
 @layer base {
@@ -20,17 +21,17 @@
   }
   
   h1, h2, h3, h4, h5, h6 {
-    @apply font-serif tracking-tight text-brand-text;
+    @apply font-sans font-semibold text-brand-text;
   }
 
   /* Accessibility focus ring */
   *:focus-visible {
-    @apply outline-none ring-2 ring-brand-cta ring-offset-2 ring-offset-brand-bg transition-shadow duration-200;
+    @apply outline-none ring-2 ring-brand-primary/30 ring-offset-2 ring-offset-brand-bg transition-shadow duration-200;
   }
 
   /* Smooth transitions globally */
-  button, a, input, select, textarea, label, div {
-    @apply transition-all duration-300 ease-in-out;
+  button, a, input, select, textarea {
+    @apply transition-colors duration-200 ease-in-out;
   }
 
   /* Reduced motion preference */

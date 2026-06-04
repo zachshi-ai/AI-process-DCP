@@ -7,11 +7,11 @@ export default {
   theme: {
     extend: {
       colors: {
-        'brand-primary': '#E8B4B8',
-        'brand-secondary': '#A8D5BA',
-        'brand-cta': '#D4AF37',
-        'brand-bg': '#FFF5F5',
-        'brand-text': '#2D3436',
+        'brand-primary': '#3370FF',
+        'brand-secondary': '#00B96B',
+        'brand-cta': '#FF7D00',
+        'brand-bg': '#F7F8FA',
+        'brand-text': '#1F2329',
       },
       boxShadow: {
         soft: '0 10px 40px -10px rgba(0,0,0,0.05)',

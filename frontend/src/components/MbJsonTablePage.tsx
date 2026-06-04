@@ -51,10 +51,12 @@ const isLongText = (v: any) => {
  * - 问题点核心简述
  * - 调整措施
  */
-export function MbJsonTablePage(props: { apiBase: string; eventIds: number[]; wide?: boolean }) {
+export function MbJsonTablePage(props: { apiBase: string; eventIds: number[]; wide?: boolean; headerTitle?: string; onClose?: () => void }) {
   const apiBase = props.apiBase;
   const eventIds = (props.eventIds || []).filter((x) => Number(x) > 0);
   const wide = Boolean(props.wide);
+  const headerTitle = props.headerTitle;
+  const onClose = props.onClose;
   const eventKey = JSON.stringify(eventIds.slice().sort((a, b) => a - b));
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -261,14 +263,40 @@ export function MbJsonTablePage(props: { apiBase: string; eventIds: number[]; wi
         </div>
       ) : null}
 
-      <div className="flex items-center justify-end gap-2 mb-3">
-        <Button type="button" variant="ghost" onClick={() => setShowPanel((v) => !v)}>
-          字段列管理
-        </Button>
-        <Button type="button" variant="secondary" isLoading={exporting} onClick={handleExportExcel}>
-          导出 Excel
-        </Button>
-      </div>
+      {headerTitle ? (
+        <div className="flex items-center justify-between gap-3 mb-3">
+          <div className="text-xl font-semibold">{headerTitle}</div>
+          <div className="border border-gray-200/70 bg-white/70 rounded-2xl p-1 flex items-center gap-2">
+            <Button type="button" variant="secondary" onClick={() => setShowPanel((v) => !v)}>
+              {showPanel ? '切换到表格视图' : '切换到字段配置视图'}
+            </Button>
+            <Button type="button" variant="primary" isLoading={exporting} onClick={handleExportExcel}>
+              导出 Excel
+            </Button>
+            {onClose ? (
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={onClose}
+                className="border border-gray-200 bg-white hover:bg-gray-50"
+              >
+                关闭
+              </Button>
+            ) : null}
+          </div>
+        </div>
+      ) : (
+        <div className="flex items-center justify-end mb-3">
+          <div className="border border-gray-200/70 bg-white/70 rounded-2xl p-1 flex items-center gap-2">
+            <Button type="button" variant="secondary" onClick={() => setShowPanel((v) => !v)}>
+              {showPanel ? '切换到表格视图' : '切换到字段配置视图'}
+            </Button>
+            <Button type="button" variant="primary" isLoading={exporting} onClick={handleExportExcel}>
+              导出 Excel
+            </Button>
+          </div>
+        </div>
+      )}
 
       {showPanel ? (
         <div className="mb-4 border border-gray-100 rounded-xl bg-white p-4 space-y-4">

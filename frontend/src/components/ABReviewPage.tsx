@@ -297,7 +297,7 @@ export function ABReviewPage(props: {
   return (
     <div className="space-y-8">
       <Card>
-        <h2 className="text-2xl font-serif font-bold mb-2">A/B Test</h2>
+        <h2 className="text-2xl font-semibold mb-2">A/B Test</h2>
         <p className="text-sm text-gray-600">
           选择本地 skill + 本地 JSON 后，系统会自动跑 A、B 两个模型；两者完成后自动触发 J（Judge）做对比并输出 winner 与置信度。
         </p>
@@ -313,7 +313,7 @@ export function ABReviewPage(props: {
         <div className="mt-5 grid grid-cols-1 md:grid-cols-2 gap-6">
           <div className="space-y-4">
             <div>
-              <label className="block text-sm font-semibold text-[#2D3436] mb-1">选择本地 skill 文件夹</label>
+              <label className="block text-sm font-semibold text-brand-text mb-1">选择本地 skill 文件夹</label>
               <div className="flex items-center gap-3">
                 <Button
                   type="button"
@@ -349,7 +349,7 @@ export function ABReviewPage(props: {
             </div>
 
             <div>
-              <label className="block text-sm font-semibold text-[#2D3436] mb-1">或选择单个 skill 文件</label>
+              <label className="block text-sm font-semibold text-brand-text mb-1">或选择单个 skill 文件</label>
               <div className="flex items-center gap-3">
                 <Button
                   type="button"
@@ -385,11 +385,11 @@ export function ABReviewPage(props: {
 
             {localSkills.length > 1 && (
               <div>
-                <label className="block text-sm font-semibold text-[#2D3436] mb-1">已识别的本地 skill</label>
+                <label className="block text-sm font-semibold text-brand-text mb-1">已识别的本地 skill</label>
                 <select
                   value={newSkillName}
                   onChange={(e) => setNewSkillName(e.target.value)}
-                  className="w-full px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50/50 text-[#2D3436] focus:bg-white focus:border-[#E8B4B8] focus:ring-4 focus:ring-[#E8B4B8]/20 outline-none"
+                  className="w-full px-4 py-2.5 rounded-xl border border-gray-200/80 bg-white/70 text-brand-text focus:bg-white focus:border-brand-primary focus:ring-4 focus:ring-brand-primary/15 outline-none"
                 >
                   {localSkills.map((s) => (
                     <option key={s.name} value={s.name}>
@@ -402,7 +402,7 @@ export function ABReviewPage(props: {
           </div>
 
           <div>
-            <label className="block text-sm font-semibold text-[#2D3436] mb-1">选择本地 JSON 文件（可多选）</label>
+            <label className="block text-sm font-semibold text-brand-text mb-1">选择本地 JSON 文件（可多选）</label>
             <div className="flex items-center gap-3">
               <Button
                 type="button"
@@ -432,15 +432,21 @@ export function ABReviewPage(props: {
           </div>
         </div>
 
-        <div className="mt-5 flex items-center gap-4">
-          <Button variant="primary" onClick={createRecord} disabled={loading}>
-            开始评审（自动跑 A/B/J）
-          </Button>
-          <Button variant="secondary" onClick={loadRecords} disabled={loading}>
-            刷新
-          </Button>
-          {loading && <span className="text-sm text-gray-500">加载中...</span>}
-          {error && <span className="text-sm text-red-500">{error}</span>}
+        <div className="mt-6 border border-gray-200/70 bg-gray-50/40 rounded-2xl p-3">
+          <div className="flex items-center justify-end gap-3 flex-wrap">
+            <Button variant="secondary" onClick={loadRecords} disabled={loading}>
+              刷新
+            </Button>
+            <Button variant="primary" onClick={createRecord} disabled={loading}>
+              开始评审（自动跑 A/B/J）
+            </Button>
+          </div>
+          {(loading || error) && (
+            <div className="mt-2 flex items-center justify-end gap-3">
+              {loading && <span className="text-sm text-gray-500">加载中...</span>}
+              {error && <span className="text-sm text-red-500">{error}</span>}
+            </div>
+          )}
         </div>
       </Card>
 
